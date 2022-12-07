@@ -1,0 +1,146 @@
+---
+title: "Batch normalisation"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(sva)
+```
+
+```{r}
+qld_counts_list <- readRDS("data/tidy_data/qld_counts_list.rds")
+sample_info <- readRDS("data/tidy_data/sample_info.rds")
+all_annotations <- readRDS("data/tidy_data/all_annotations.rds")
+```
+
+-----
+
+# Normalise data
+
+```{r}
+sample_info <- sample_info %>% 
+  select(sample_id, rna_seq_id, age, cycle_stage) %>%
+  mutate(study=ifelse(str_detect(sample_id, "^URS"), "study_2", "study_1")) %>%
+  filter(! is.na(rna_seq_id))
+
+# Samples with RNA-seq data, but no sample info 
+# (usually this is due to replicates and missing/discordant pathology estimate)
+colnames(qld_counts_list$counts)[! colnames(qld_counts_list$counts) %in% sample_info$rna_seq_id]
+
+# Check all samples listed to have RNA-seq data are in the count matrix
+stopifnot(sample_info$rna_seq_id %in% colnames(qld_counts_list$counts))
+```
+
+```{r}
+y <- qld_counts_list$counts[,sample_info$sample_id]
+y <- y[rowMeans(cpm(y) > 0.5) > 0.2,]
+dim(y)
+
+y <- DGEList(counts=y)
+y <- calcNormFactors(y)
+nc <- cpm(y, normalized.lib.sizes=TRUE, log=TRUE)
+```
+
+## Batch correction
+
+```{r}
+# From EDA, saw a small batch effect in 1_1 and 1_2 (the 120bp library)
+pca <- prcomp(t(nc))
+pca <- data.frame(pca$x[,1:6]) %>% tibble::rownames_to_column("sample_id")
+```
+
+```{r}
+dat <- merge(pca, sample_info, by="sample_id")
+ggplot(dat, aes(x=PC1, y=PC2, label=sample_id, color=cycle_stage)) +
+  geom_text(size=2) +
+  theme_bw()
+```
+
+```{r}
+merge(pca, qld_counts_list$sample_info, by="sample_id") %>%
+  mutate(batch=sprintf("%d_%d", sequencing_batch, flowcell_batch),
+         sequencing_batch=factor(sequencing_batch)) %>%
+  ggplot(aes(x=PC4, y=PC5, label=sample_id, color=sequencing_batch)) +
+  geom_point() +
+  theme_bw()
+```
+
+```{r}
+merge(pca, qld_counts_list$sample_info, by="sample_id") %>%
+  mutate(batch=sprintf("%d_%d", sequencing_batch, flowcell_batch)) %>%
+  ggplot(aes(x=PC6, y=PC5, label=sample_id, color=batch)) +
+  geom_point() +
+  theme_bw()
+```
+
+
+```{r}
+# Check if batches have any confounders
+batch <- qld_counts_list$sample_info$sequencing_batch
+names(batch) <- qld_counts_list$sample_info$sample_id
+table(batch[sample_info$sample_id], sample_info$cycle_stage)
+```
+
+```{r}
+combat_nc <- ComBat(dat=nc, batch=batch[colnames(nc)], mod=NULL)
+```
+
+```{r}
+pca <- prcomp(t(combat_nc))
+pca <- data.frame(pca$x[,1:6]) %>% tibble::rownames_to_column("sample_id")
+dat <- merge(pca, sample_info, by="sample_id")
+ggplot(dat, aes(x=PC1, y=PC2, label=sample_id, color=cycle_stage)) +
+  geom_text(size=2) +
+  theme_bw()
+```
+
+```{r}
+pca <- prcomp(t(combat_nc))
+pca <- data.frame(pca$x[,1:6]) %>% tibble::rownames_to_column("sample_id")
+dat <- merge(pca, sample_info, by="sample_id")
+ggplot(dat, aes(x=PC1, y=PC2, label=sample_id, color=cycle_stage)) +
+  geom_point(size=2) +
+  theme_bw()
+```
+
+
+-----
+
+# Save data
+
+```{r}
+saveRDS(combat_nc, file="data/tidy_data/batch_normalised_exprs.rds")
+```
+
+-----
+
+# Session Info
+
+```{r}
+devtools::session_info()
+```

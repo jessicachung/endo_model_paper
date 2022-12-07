@@ -1,0 +1,262 @@
+---
+title: "Cycle model: Normalisation"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+---
+
+This notebook normalises the expression data to remove cycle time effects.
+
+Using the molecular time estimate from the previous notebook, a spline is fit for each
+gene, and the curve is subtracted from the expression to obtain a normalised
+value.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(sva)
+library(splines)
+```
+
+```{r}
+fit_spline_model <- function(y, x, spline_k=6, spline_fx=FALSE, spline_bs="cc", 
+                             gamma=1, predict_range=seq(0,28,by=0.1), 
+                             weights=NULL, knots=NULL, return_coefs=FALSE,
+                             return_fit=TRUE) {
+  
+  fit <- gam(y ~ s(x, bs=spline_bs, k=spline_k, fx=spline_fx), 
+             knots=knots, weights=weights, gamma=gamma)
+  fit_summary <- summary(fit)
+  
+  pred <- predict(fit, newdata=data.frame(x=predict_range))
+  pred <- data.frame(cycle_time=predict_range, pred=pred)
+  
+  results <- list(pred=pred, 
+                  edf=round(fit_summary$edf, 3),
+                  R2=round(fit_summary$r.sq, 4),
+                  dev_exp=round(fit_summary$dev.expl, 4),
+                  s_table=fit_summary$s.table)
+  if (return_coefs) results$coefs <- fit$coefficients
+  if (return_fit) results$fit <- fit
+  return(results)
+}
+
+
+plot_spline_model <- function(spline_list, y, x, gene_name="", alpha_point=1,
+                              alpha_line=0.5, jitter_height=0, jitter_width=0.05, 
+                              plot=TRUE) {
+  dat <- data.frame(exprs=y, cycle_time=x)
+  g <- ggplot(dat, aes(x=cycle_time, y=exprs)) +
+    geom_jitter(height=jitter_height, width=jitter_width, alpha=alpha_point) +
+    geom_line(spline_list$pred, mapping=aes(x=cycle_time, y=pred), alpha=alpha_line) +
+    labs(title=sprintf("%s | R^2 = %0.3f | edf = %0.2f", 
+                       gene_name, spline_list$R2, spline_list$edf))
+  if (! plot) return(g)
+  print(g)
+}
+```
+
+```{r}
+# qld_counts_list <- readRDS("data/tidy_data/qld_counts_list.rds")
+# sample_info <- readRDS("data/tidy_data/sample_info.rds")
+# all_annotations <- readRDS("data/tidy_data/all_annotations.rds")
+combat_nc <- readRDS("data/tidy_data/batch_normalised_exprs.rds")
+```
+
+```{r}
+dataset_id <- "2021-03-23"
+combat_phenotype <- readRDS(file=sprintf("data/tidy_data/combat_phenotype_%s.rds", dataset_id))
+```
+
+-----
+
+# Correct for cycle stage
+
+Using the transformed day obtained from the previous model.
+
+## Fit spline
+
+```{r}
+# Only study 1 samples
+pheno <- combat_phenotype %>% filter(! is.na(transformed_time))
+exprs <- combat_nc[,pheno$sample_id]
+cycle_time <- as.numeric(pheno$transformed_time)
+genes <- rownames(exprs)
+cycle_range <- seq(0, 100, by=1)
+
+# Manually set knots
+k_knots <- 30
+spline_knots <- list(x=seq(0,100,length=k_knots))
+
+gene_models <- lapply(genes, function(p) {
+  fit_spline_model(y=exprs[p,], x=cycle_time, spline_k=k_knots, gamma=4, knots=spline_knots,
+                   predict_range=cycle_range, return_fit=FALSE)
+})
+names(gene_models) <- genes
+```
+
+```{r}
+# Get expected values for each cycle day for each probe
+expected_exprs <- sapply(genes, function(p) gene_models[[p]]$pred$pred) %>% 
+  t %>% magrittr::set_colnames(paste0("time_", cycle_range))
+
+# Get probe R^2 values
+r2 <- sapply(genes, function(p) gene_models[[p]]$R2)
+
+# Get df for models
+spline_edf <- sapply(genes, function(p) gene_models[[p]]$edf)
+table(cut(spline_edf, breaks = 5))
+
+# Get deviance explained
+dev_exp <- sapply(genes, function(p) gene_models[[p]]$dev_exp)
+cor(r2, dev_exp)
+
+# Get coefficients
+# coefs <- sapply(genes, function(p) gene_models[[p]]$coefs) %>% t
+# colnames(coefs) <- str_remove_all(colnames(coefs), "[()]")
+
+# Get p-values
+pvals <- sapply(genes, function(p) gene_models[[p]]$s_table[1,"p-value"])
+
+model_df <- data.frame(probe_id=genes, r2=r2, spline_edf=spline_edf, 
+                       dev_exp=dev_exp, p=pvals, 
+                       stringsAsFactors=FALSE)
+```
+
+```{r}
+ggplot(model_df, aes(x=spline_edf, y=r2)) +
+  geom_point(alpha=0.2, size=1)
+```
+
+```{r results="markup"}
+# Examine some genes
+
+# Flat
+g <- model_df %>% filter(spline_edf %>% between(0, 0)) %>% head(1)
+g %>% t
+plot_spline_model(gene_models[[g$probe_id]], x=cycle_time, y=exprs[g$probe_id,], gene_name=g$probe_id)
+
+# Almost flat
+g <- model_df %>% filter(spline_edf %>% between(1, 1.5)) %>% head(1)
+g %>% t
+plot_spline_model(gene_models[[g$probe_id]], x=cycle_time, y=exprs[g$probe_id,], gene_name=g$probe_id)
+
+# High spline_edf but low r2
+g <- model_df %>% filter(spline_edf > 3, r2 < 0.15) %>% head(1)
+g %>% t
+plot_spline_model(gene_models[[g$probe_id]], x=cycle_time, y=exprs[g$probe_id,], gene_name=g$probe_id)
+
+# Okay fit
+g <- model_df %>% filter(spline_edf %>% between(3, 6.5), r2 %>% between(0.30, 0.31)) %>% head(1)
+g %>% t
+plot_spline_model(gene_models[[g$probe_id]], x=cycle_time, y=exprs[g$probe_id,], gene_name=g$probe_id)
+
+# Good fits: high spline_edf and high r2
+g <- model_df %>% arrange(desc(r2)) %>% head(1)
+g %>% t
+plot_spline_model(gene_models[[g$probe_id]], x=cycle_time, y=exprs[g$probe_id,], gene_name=g$probe_id)
+```
+
+```{r}
+for (g in model_df %>% arrange(desc(r2)) %>% head(5) %>% pull(probe_id)) {
+  plot_spline_model(gene_models[[g]], x=cycle_time, y=exprs[g,], gene_name=g)
+}
+```
+
+```{r}
+# Get best estimate (just to check, don't intend to use)
+fit3_best_estimate <- sapply(colnames(combat_nc), function(s) {
+  sweep(x=expected_exprs, MARGIN=1, STATS=combat_nc[,s]) %>% 
+    `^`(2) %>% colSums %>% which.min %>% names %>% str_replace("time_", "") %>%
+    as.numeric
+})
+```
+
+```{r}
+ggplot(data.frame(be1=combat_phenotype$transformed_time_2, be2=fit3_best_estimate),
+       aes(x=be1, y=be2)) +
+  geom_point(alpha=0.3) +
+  geom_abline(color="red", linetype="dashed")
+```
+
+-----
+
+# Cycle day correction
+
+```{r}
+stopifnot(colnames(combat_nc) == combat_phenotype$sample_id)
+cycle_time <- round(combat_phenotype$transformed_time_2)
+obs <- combat_nc
+exp <- expected_exprs[,paste0("time_", cycle_time)]
+gene_means <- apply(exp, 1, mean)
+dev <- obs - exp
+normalised_exprs <- sweep(dev, MARGIN=1, STATS=gene_means, FUN="+")
+```
+
+
+```{r}
+g <- "ENSG00000187231"
+plot_spline_model(gene_models[[g]],
+                  y=combat_nc[g,], x=cycle_time,
+                  gene_name = g, plot=FALSE) +
+  scale_y_continuous(limits=c(5.0, 9.1))
+dat <- data.frame(cycle_time=cycle_time,
+                  normalised_exprs=normalised_exprs[g,combat_phenotype$sample_id])
+ggplot(dat, aes(x=cycle_time, y=normalised_exprs)) +
+  geom_point() +
+  geom_hline(yintercept=gene_means[g], linetype="dashed") +
+  scale_y_continuous(limits=c(5.0, 9.1)) +
+  labs(title="ENSG00000187231 (cycle normalised)")
+```
+
+```{r}
+g <- "ENSG00000100485"
+plot_spline_model(gene_models[[g]],
+                  y=combat_nc[g,], x=cycle_time,
+                  gene_name = g, plot=FALSE) +
+  scale_y_continuous(limits=c(5, 7)) 
+dat <- data.frame(cycle_time=cycle_time,
+                  normalised_exprs=normalised_exprs[g,combat_phenotype$sample_id])
+ggplot(dat, aes(x=cycle_time, y=normalised_exprs)) +
+  geom_point() +
+  geom_hline(yintercept=gene_means[g], linetype="dashed") +
+  scale_y_continuous(limits=c(5, 7)) +
+  labs(title="ENSG00000100485 (cycle normalised)")
+```
+
+
+-----
+
+# Save data
+
+```{r}
+unique_id <- "2021-03-23_k30_g4"
+saveRDS(gene_models, file=sprintf("data/gene_models/gene_models_%s.rds", unique_id))
+saveRDS(normalised_exprs, file=sprintf("data/tidy_data/cycle_normalised_exprs_%s.rds",
+                                       unique_id))
+```
+
+-----
+
+# Session Info
+
+```{r}
+devtools::session_info()
+```

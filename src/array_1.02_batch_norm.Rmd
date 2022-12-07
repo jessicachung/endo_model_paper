@@ -1,0 +1,232 @@
+---
+title: "Batch Correction with ComBat"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+---
+
+Use ComBat to correct batch effects. Don't use cycle stage as a covariate
+in the model.
+
+Separate batch correction for study 1 and 2, then combine (due to composition bias of study 2).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+-----
+
+# Load
+
+```{r message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(sva)
+library(limma)
+library(edgeR)
+```
+
+### Load data
+
+```{r}
+# Microarray data
+exprs <- readRDS("data/array_data/combined_bg_rsn_exprs.rds")
+pval <- readRDS("data/array_data/combined_pval.rds")
+
+# Phenotype data
+phenotype <- readRDS("data/tidy_data/sample_info.rds")
+
+# Batch data
+batch_data <- readRDS("data/array_data/batch_data.rds")
+```
+
+```{r}
+stopifnot(colnames(exprs) == colnames(pval))
+```
+
+-----
+
+# Wrangle
+
+```{r}
+phenotype <- phenotype %>%
+  mutate(study=ifelse(str_detect(sample_id, "^URS"), "study_2", "study_1"))
+urs_array_samples <- phenotype %>% 
+  filter(! is.na(array_data)) %>% 
+  filter(study == "study_2") %>%
+  pull(sample_id)
+```
+
+```{r}
+# Change X# names of URS samples to URS###
+names_to_change <- batch_data %>% filter(study == "study_2") %>% .$sample_id
+tmp <- str_match(names_to_change, "^X([0-9]+)(_?\\w)?$")
+tmp[,2] <- sprintf("%03d", as.numeric(tmp[,2]))
+tmp[,3][is.na(tmp[,3])] <- ""
+new_names <- paste0("URS", tmp[,2], tmp[,3])
+new_name_lookup <- new_names
+names(new_name_lookup) <- names_to_change
+stopifnot(urs_array_samples %in% new_name_lookup)
+new_name_lookup <- new_name_lookup[new_name_lookup %in% urs_array_samples]
+```
+
+```{r}
+urs_indices <- colnames(exprs) %in% names(new_name_lookup)
+colnames(exprs)[urs_indices] <- new_name_lookup[colnames(exprs)[urs_indices]]
+colnames(pval)[urs_indices] <- new_name_lookup[colnames(pval)[urs_indices]]
+
+urs_indices <- batch_data$sample_id %in% names(new_name_lookup)
+batch_data$sample_id[urs_indices] <-
+  new_name_lookup[batch_data$sample_id[urs_indices]]
+```
+
+-----
+
+# Study 1 Combat batch correction
+
+```{r}
+# Use all samples from study 1
+s1_pheno <- batch_data %>% filter(study == "study_1") %>%
+  filter(str_detect(sample_id, "^X"))
+table(s1_pheno$batch, useNA = "always")
+```
+
+```{r}
+# Get expression matrix
+y <- exprs[,s1_pheno$sample_id]
+
+# Get batch info
+batch <- s1_pheno$batch %>% factor
+
+# Combat covariates
+mod <- model.matrix(~1, data=s1_pheno)
+
+# Combat normalisation
+study_1_combat_exprs <- ComBat(y, batch=batch, mod=mod)
+```
+
+-----
+
+# Study 2 Combat batch correction
+
+```{r}
+# Use all samples from study 2
+s2_pheno <- batch_data %>% filter(study == "study_2") %>%
+  filter(str_detect(sample_id, "^X|^URS"))
+table(s2_pheno$batch, useNA = "always")
+```
+
+```{r}
+batch_6.1_barcodes <- c("3999650006", "3999650008", "3999650067", "3999650060")
+batch_6.2_barcodes <- c("3999650037", "3999650055", "3999650048", "3999650059")
+
+s2_pheno <- s2_pheno %>% 
+  mutate(batch=ifelse(sentrix_barcode %in% batch_6.1_barcodes, "6.1", batch),
+         batch=ifelse(sentrix_barcode %in% batch_6.2_barcodes, "6.2", batch))
+table(s2_pheno$batch, useNA = "always")
+```
+
+```{r}
+# Get expression matrix
+y <- exprs[,s2_pheno$sample_id]
+
+# Get batch info
+batch <- s2_pheno$batch %>% factor
+
+# Combat covariates
+mod <- model.matrix(~1, data=s2_pheno)
+
+# Combat normalisation
+study_2_combat_exprs <- ComBat(y, batch=batch, mod=mod)
+```
+
+-----
+
+# Combine study 1 and study 2
+
+```{r}
+s1 <- phenotype %>% filter(sample_id %in% s1_pheno$sample_id)
+table(s1$cycle_stage)
+
+s2 <- phenotype %>% filter(sample_id %in% s2_pheno$sample_id)
+table(s2$cycle_stage)
+```
+
+```{r}
+set.seed(41)
+# Randomly pick 21 samples from stage 5 and 6 from study 1 and 30 samples from stage 5 and 6 from study 2
+subset_samples <- c(
+  s1 %>% filter(cycle_stage == 5) %>% pull(sample_id) %>% sample(21),
+  s1 %>% filter(cycle_stage == 6) %>% pull(sample_id) %>% sample(21),
+  s2 %>% filter(cycle_stage == 5) %>% pull(sample_id) %>% sample(30),
+  s2 %>% filter(cycle_stage == 6) %>% pull(sample_id) %>% sample(30)
+)
+```
+
+```{r}
+# Get the study-specific effect
+pheno <- phenotype %>% filter(sample_id %in% subset_samples)
+y <- cbind(study_1_combat_exprs, study_2_combat_exprs)[,pheno$sample_id]
+design <- model.matrix(~study+cycle_stage, pheno)
+fit <- lmFit(y, design)
+fit <- eBayes(fit)
+hist(topTable(fit, coef=2, n=Inf)$P.Value, breaks=100)
+```
+
+```{r}
+# Subtract study coefficient
+study_2_coef <- fit$coefficients[,"studystudy_2"]
+stopifnot(rownames(study_2_combat_exprs) == names(study_2_coef))
+
+# Subtract coef from study 2 expression data
+study_2_exprs_corrected <- sweep(study_2_combat_exprs, 1, study_2_coef)
+combined_combat_exprs_corrected <- 
+  cbind(study_1_combat_exprs, study_2_exprs_corrected)
+```
+
+```{r}
+# Sanity check
+y <- combined_combat_exprs_corrected[,pheno$sample_id]
+design <- model.matrix(~study+cycle_stage, pheno)
+fit <- lmFit(y, design)
+fit <- eBayes(fit)
+stopifnot(topTable(fit, coef=2)$P.Value > 0.9)
+```
+
+## Output combined raw data
+
+```{r}
+# Only output samples that will be used in analysis
+array_phenotype <- phenotype %>% filter(! is.na(array_data))
+combined_combat_exprs_corrected <- 
+  combined_combat_exprs_corrected[,array_phenotype$sample_id]
+pval <- pval[,array_phenotype$sample_id]
+```
+
+```{r}
+output <- TRUE
+if (output) {
+  saveRDS(combined_combat_exprs_corrected,
+          file="data/array_data/combined_combat_exprs_corrected.rds")
+  saveRDS(pval,
+          file="data/array_data/pval.rds")
+}
+```
+
+-----
+
+# Session Info
+
+```{r}
+devtools::session_info()
+```
+
+

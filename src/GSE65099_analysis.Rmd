@@ -1,0 +1,243 @@
+---
+title: "Cycle model: External data"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+---
+
+Endo data from GSE65099  
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE65099
+
+Loss of Endometrial Plasticity in Recurrent Pregnancy Loss  
+https://pubmed.ncbi.nlm.nih.gov/26418742/
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(sva)
+library(splines)
+library(readxl)
+library(illuminaHumanv3.db)
+library(DBI)
+library(janitor)
+library(preprocessCore)
+select <- dplyr::select
+```
+
+
+```{r}
+unique_id <- "2021-03-23"
+combat_nc <- readRDS("data/tidy_data/batch_normalised_exprs.rds")
+
+unique_id <- "2021-03-23_k30_g4"
+gene_models <- readRDS(sprintf("data/gene_models/gene_models_%s.rds", unique_id))
+```
+
+```{r}
+# Get expected_exprs
+cycle_range <- gene_models[[1]]$pred$cycle_time
+genes <- names(gene_models)
+expected_exprs <- sapply(genes, function(p) gene_models[[p]]$pred$pred) %>% 
+  t %>% magrittr::set_colnames(paste0("time_", cycle_range))
+```
+
+
+```{r}
+all_probe_annotation <- illuminaHumanv3fullReannotation() %>%
+  dplyr::select(IlluminaID, ProbeQuality, SymbolReannotated, EnsemblReannotated,
+                EntrezReannotated) %>% janitor::clean_names()
+```
+
+```{r}
+geo_df <- read.table("data/ext_data/GSE65099_GeneLevel_Raw_data.csv",
+                     sep=",", header=TRUE, stringsAsFactors=FALSE)
+geo_sample_info <- read.table("data/ext_data/GSE65099_filtered_metadata.csv",
+                              sep=",", header=TRUE, stringsAsFactors=FALSE)
+
+geo_counts <- as.matrix(geo_df[,c(-1,-2)])
+rownames(geo_counts) <- geo_df[,1]
+```
+
+-----
+
+# Wrangle GSE data
+
+### Sample info data
+
+```{r}
+gse_phenotype <- geo_sample_info %>%
+  janitor::clean_names() %>%
+  dplyr::rename(sample_id="x")
+```
+
+```{r}
+geo_lh_day <- gse_phenotype$cycle_day %>% str_replace("LH\\+", "") %>%
+  as.numeric
+gse_phenotype$post_lh <- geo_lh_day
+```
+
+### Expression data
+
+```{r}
+all_gse_matrix <- geo_df %>% select(-gene_symbol, -X) %>% 
+  as.matrix
+rownames(all_gse_matrix) <- geo_df$X
+```
+
+```{r}
+gse_matrix <- all_gse_matrix
+```
+
+```{r}
+common_probes <- intersect(rownames(expected_exprs), rownames(all_gse_matrix))
+length(common_probes)
+```
+
+```{r}
+filtered_common_probes <- common_probes
+```
+
+-----
+
+# Normalisation
+
+```{r}
+# Create a reference to quantile normalise against
+tmp <- apply(combat_nc, 2, sort)
+tmp <- apply(tmp, 1, median)
+tmp %>% head
+
+ref <- tmp
+head(ref)
+
+gse_norm <- normalize.quantiles.use.target(gse_matrix[filtered_common_probes,], target=ref)
+colnames(gse_norm) <- colnames(gse_matrix)
+rownames(gse_norm) <- filtered_common_probes
+```
+
+-----
+
+# Endo cycle norm
+
+```{r}
+get_molecular_time <- function(observed, expected) {
+  mse <- sweep(x=expected, MARGIN=1, STATS=observed, FUN="-") %>%
+    `^`(2) %>% colMeans
+  df <- data.frame(time=as.numeric(str_remove(names(mse), "time_")),
+                    mse=mse)
+  rownames(df) <- NULL
+  time <- df[which.min(df$mse), "time"]
+  return(list(mse=mse, mse_df=df, time=time))
+}
+
+molecular_model <- function(expression_matrix) {
+  sample_names <- colnames(expression_matrix)
+  common_genes <- intersect(rownames(expression_matrix), rownames(expected_exprs))
+  exp <- expected_exprs[common_genes,]
+  results <- lapply(sample_names, function(x) {
+    get_molecular_time(observed=expression_matrix[,x], expected=exp)
+  })
+  mse <- sapply(results, function(x) x$mse)
+  colnames(mse) <- sample_names
+  rownames(mse) <- str_remove(rownames(mse), "time_")
+  model_time <- sapply(results, function(x) x$time)
+  names(model_time) <- sample_names
+  return(list(mse=mse, time=model_time))
+}
+
+plot_mse <- function(object, sample_name="") {
+  df <- data.frame(time=as.numeric(rownames(object$mse)),
+                   mse=object$mse[,sample_name])
+  ggplot(df, aes(x=time, y=mse)) +
+    geom_line() +
+    geom_vline(xintercept=object$time[sample_name], linetype="dashed", color="red") +
+    scale_x_continuous(breaks=seq(0, 100, by=10)) +
+    theme_bw() +
+    labs(title=sprintf("%s", sample_name), x="Time", y="Mean Square Error")
+}
+```
+
+```{r}
+results <- molecular_model(gse_norm)
+```
+
+```{r}
+gse_phenotype <- gse_phenotype %>% mutate(model_time=results$time[sample_id])
+```
+
+```{r}
+endometrium_samples <- gse_phenotype
+```
+
+```{r}
+ggplot(endometrium_samples, aes(x=model_time, y=post_lh)) +
+  geom_point()
+```
+
+```{r}
+# MSE plot examples
+for (samp in head(endometrium_samples$sample_id, 5)) {
+  plot_mse(results, samp) %>% print
+}
+```
+
+
+```{r}
+# Model time < 60 (prolif)
+tmp <- endometrium_samples %>% filter(model_time < 60) %>%
+  pull(sample_id)
+for (samp in tmp) {
+  plot_mse(results, samp) %>% print
+}
+```
+
+-----
+
+# PCA
+
+```{r}
+dat <- endometrium_samples
+pca <- prcomp(t(gse_norm[,dat$sample_id]), scale.=FALSE)$x[,1:4]
+pca <- as.data.frame(pca) %>% tibble::rownames_to_column("sample_id") %>%
+  merge(dat, by="sample_id")
+
+ggplot(pca, aes(x=PC1, y=PC2, color=cycle_day)) +
+  geom_point()
+ggplot(pca, aes(x=PC1, y=PC2, color=model_time)) +
+  geom_point() +
+  scale_colour_gradientn(limits=c(0,100), colors=rainbow(20)[2:19])
+```
+
+```{r}
+saveRDS(pca, "cache/fig4c.rds")
+```
+
+
+
+-----
+
+# Session Info
+
+```{r}
+devtools::session_info()
+```
+

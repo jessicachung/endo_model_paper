@@ -1,0 +1,1085 @@
+---
+title: "Age analysis (combined)"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+External endo data from GSE141549  
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE141549
+
+A relational database to identify differentially expressed genes in the endometrium and endometriosis lesions  
+https://www.nature.com/articles/s41597-020-00623-x
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+
+
+```{r}
+top_table_annotated <- function(fit, coef=2, n=6, annotation, by="ensembl_gene_id") {
+  if (length(coef) == 1) {
+    sort_by <- "p"
+  } else {
+    sort_by <- "F"
+  }
+  topTable(fit, coef=coef, n=n, sort.by=sort_by) %>%
+    tibble::rownames_to_column(var=by) %>%
+    merge(annotation, by=by, all.x=TRUE) %>%
+    arrange(P.Value) %>%
+    select(1, contains("logFC"), AveExpr:adj.P.Val,
+           everything())
+}
+```
+
+
+```{r}
+run_ora <- function(top_table, run_go=TRUE, run_kegg=FALSE,
+                    run_reactome=FALSE, p_threshold=0.05,
+                    directional=TRUE) {
+  up_de <- top_table %>% filter(adj.P.Val < p_threshold, logFC > 0) %>%
+    pull(entrez_gene_id)
+  down_de <- top_table %>% filter(adj.P.Val < p_threshold, logFC < 0) %>%
+    pull(entrez_gene_id)
+  de <- top_table %>% filter(adj.P.Val < p_threshold) %>% 
+    pull(entrez_gene_id)
+  universe <- top_table$entrez_gene_id
+  results <- list()
+  # qvalueCutoff=0.05 argument doesn't work... Filter manually afterwards
+  if (run_go) {
+    if (directional) {
+      results[["up_go"]] <- 
+        enrichGO(up_de, OrgDb = "org.Hs.eg.db", ont="all", 
+                 universe=universe, readable=TRUE)
+      results[["down_go"]] <- 
+        enrichGO(down_de, OrgDb = "org.Hs.eg.db", ont="all", 
+                 universe=universe, readable=TRUE)
+    } else {
+      results[["go"]] <-
+        enrichGO(de, OrgDb = "org.Hs.eg.db", ont="all", 
+                 universe=universe, readable=TRUE)
+    }
+  }
+  if (run_kegg) {
+    if (directional) {
+      results[["up_kegg"]] <- 
+        enrichKEGG(up_de, organism="hsa", universe=universe)
+      results[["down_kegg"]] <- 
+        enrichKEGG(down_de, organism="hsa", universe=universe)
+    } else {
+      results[["kegg"]] <-
+        enrichKEGG(de, organism="hsa", universe=universe)
+    }
+  }
+  if (run_reactome) {
+    if (directional) {
+      results[["up_reactome"]] <- 
+        enrichPathway(gene=up_de, universe=universe, readable=TRUE)
+      results[["down_reactome"]] <- 
+        enrichPathway(gene=down_de, universe=universe, readable=TRUE)
+    } else {
+      results[["reactome"]] <- 
+        enrichPathway(gene=de, universe=universe, readable=TRUE)
+    }
+  }
+  return(results)
+}
+```
+
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(sva)
+library(splines)
+library(readxl)
+library(illuminaHumanv4.db)
+library(DBI)
+library(janitor)
+library(preprocessCore)
+library(endest)
+library(splines)
+library(metapro)
+library(ggvenn)
+
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(ReactomePA)
+
+select <- dplyr::select
+```
+
+```{r}
+# Microarray data
+rwh_exprs <- readRDS(here::here("data/array_data/combined_bg_rsn_exprs.rds"))
+rwh_pval <- readRDS(here::here("data/array_data/combined_pval.rds"))
+
+# Phenotype data
+# rwh_array_phenotype <- readRDS(here::here("data/tidy_data/sample_info.rds"))
+
+# Batch data
+rwh_batch_data <- readRDS(here::here("data/array_data/batch_data.rds"))
+
+# Combat microarray
+rwh_combat_exprs <- readRDS(here::here("data/array_data/combined_combat_exprs_corrected.rds"))
+
+rwh_probe_info <- readRDS(here::here("data/array_data/illumina_v4_annotation.rds"))
+
+unique_id <- "2020-12-02"
+rwh_array_phenotype <- readRDS(here::here(
+  sprintf("data/tidy_data/array_combat_phenotype_%s.rds", unique_id)))
+```
+
+```{r}
+qld_counts_list <- readRDS(here::here("data/tidy_data/qld_counts_list.rds"))
+all_annotations <- readRDS(here::here("data/tidy_data/all_annotations.rds"))
+
+unique_id <- "2021-03-23"
+combat_phenotype <- readRDS(here::here(sprintf("data/tidy_data/combat_phenotype_%s.rds", unique_id)))
+combat_nc <- readRDS(here::here("data/tidy_data/batch_normalised_exprs.rds"))
+```
+
+```{r}
+all_probe_annotation <- illuminaHumanv4fullReannotation() %>%
+  dplyr::select(IlluminaID, ProbeQuality, SymbolReannotated, EnsemblReannotated,
+                EntrezReannotated) %>% janitor::clean_names()
+```
+
+```{r}
+gse_xlsx_filename <- here::here("data/ext_data/GSE141549_batchCorrectednormalizedArrayscombined.xlsx")
+gse_data <- read_excel(gse_xlsx_filename) %>% janitor::clean_names()
+```
+
+```{r}
+gse_1 <- read_delim(here::here("data/ext_data/GSE141549-GPL10558_series_matrix.txt"), delim="\t", comment="!Series") %>%
+  janitor::clean_names()
+gse_2 <- read_delim(here::here("data/ext_data/GSE141549-GPL13376_series_matrix.txt"), delim="\t", comment="!Series") %>%
+  janitor::clean_names()
+```
+
+
+-----
+
+# Wrangle GSE data
+
+### Sample info data
+
+```{r}
+stopifnot(gse_1$sample_title == gse_2$sample_title)
+gse_phenotype_combined <- cbind(gse_1,  gse_2[,-1])
+```
+
+```{r}
+gse_phenotype <- gse_phenotype_combined %>%
+  filter(sample_title %in% c("!Sample_geo_accession", "!Sample_source_name_ch1",
+                          "!Sample_description", "!Sample_characteristics_ch1"))
+rownames(gse_phenotype) <- c("geo_accession", "source", "tissue", "age",
+                             "disease_stage", "cycle_phase", "description")
+
+gse_phenotype <- gse_phenotype %>% t %>% data.frame(stringsAsFactors=FALSE)
+gse_phenotype <- gse_phenotype[-1,] %>% tibble::rownames_to_column("sample_id")
+
+gse_phenotype <- gse_phenotype %>%
+  mutate(age=as.numeric(str_remove(age, "age: ")),
+         disease_stage=str_remove(disease_stage, "disease stage: "),
+         cycle_phase=str_remove(cycle_phase, "cycle phase: "),
+         tissue=str_remove(tissue, "tissue: "))
+```
+
+```{r}
+# Some rows have incorrect delimiting for disease_stage and cycle phase
+gse_phenotype %>% filter(disease_stage == "cycle phase: secretory")
+
+i <- which(gse_phenotype$disease_stage == "cycle phase: secretory")
+gse_phenotype[i,"cycle_phase"] <- "secretory"
+```
+
+```{r}
+gse_phenotype %>% filter(source == "Endometrium") %>% pull(tissue) %>% table
+gse_phenotype %>% filter(tissue == "Endometrium") %>% pull(source) %>% table
+```
+
+```{r}
+# Get only endometrium samples and also remove replicates
+# Might remove medication samples later, but keep them here for now
+endometrium_samples <- gse_phenotype %>% 
+  filter(source == "Endometrium") %>%
+  filter(! str_detect(sample_id, "_replicate$")) %>%
+  mutate(medication=ifelse(cycle_phase == "medication", 1, 0))
+```
+
+-----
+
+# Cycle time estimation
+
+## endest: GSE141549
+
+```{r}
+all_gse_matrix <- gse_data %>% select(-gene_symbol, -probe_id) %>% 
+  as.matrix
+rownames(all_gse_matrix) <- gse_data$probe_id
+```
+
+```{r}
+# table(all_probe_annotation$illumina_id %in% rwh_probe_info$IlluminaID)
+table(rownames(all_gse_matrix) %in% all_probe_annotation$illumina_id)
+
+m <- match(rownames(all_gse_matrix), all_probe_annotation$illumina_id)
+estimate <- estimate_cycle_time(
+  all_gse_matrix,
+  ensembl_ids=all_probe_annotation[m,"ensembl_reannotated"]
+)
+
+estimate$estimated_time %>% head
+```
+
+
+```{r}
+endometrium_samples <- endometrium_samples %>%
+  mutate(model_time=estimate$estimated_time[sample_id])
+```
+
+```{r}
+# dat <- endometrium_samples  %>% filter(cycle_phase %in% c("menstruation", "proliferative", "secretory", "unknown"))
+dat <- endometrium_samples %>% 
+  filter(medication == 0) %>%
+  mutate(cycle_stage=ifelse(
+    cycle_phase %in% c("menstruation", "proliferative", "secretory"), 
+    cycle_phase, NA))
+tmp <- prcomp(t(all_gse_matrix[,dat$sample_id]), scale.=FALSE)
+ev <- tmp$sdev^2
+pca <- tmp$x[,1:4]
+pca <- as.data.frame(pca) %>% tibble::rownames_to_column("sample_id") %>%
+  merge(dat, by="sample_id")
+
+ggplot(pca, aes(x=PC1, y=PC2, color=cycle_stage)) +
+  geom_point() +
+  theme_bw()
+ggplot(pca, aes(x=PC1, y=PC2, color=model_time)) +
+  geom_point() +
+  scale_colour_gradientn(limits=c(0,100), colors=rainbow(20)[2:19]) +
+  theme_bw()
+```
+
+```{r}
+plot(ev[1:10]/sum(ev), type="b")
+```
+
+```{r}
+saveRDS(pca, file=here::here("cache/fig_4b_1.14.rds"))
+saveRDS(ev, file=here::here("cache/fig_4b_ev.rds"))
+```
+
+
+## endest: RNA-seq
+
+```{r}
+estimate <- estimate_cycle_time(combat_nc)
+
+estimate$estimated_time %>% head
+```
+
+
+```{r}
+rwh_rna_phenotype <- combat_phenotype %>%
+  mutate(model_time=estimate$estimated_time[sample_id])
+```
+
+```{r}
+rwh_rna_phenotype <- rwh_rna_phenotype %>% 
+  mutate(age=as.numeric(age)) %>%
+  mutate(cycle=case_when(
+    transformed_time_2 %>% between(0,7.999999) ~ "menstrual",
+    transformed_time_2 %>% between(8,57.999999) ~ "proliferative",
+    transformed_time_2 %>% between(58,100) ~ "secretory",
+    TRUE ~ ""))
+table(rwh_rna_phenotype$cycle)
+```
+
+
+```{r}
+batch <- qld_counts_list$sample_info$sequencing_batch
+names(batch) <- qld_counts_list$sample_info$sample_id
+stopifnot(rwh_rna_phenotype$sample_id %in% names(batch))
+rwh_rna_phenotype$batch <- factor(batch[rwh_rna_phenotype$sample_id])
+table(rwh_rna_phenotype$batch)
+```
+
+```{r}
+# X210213 is missing age in spreadsheet
+rwh_rna_phenotype %>% filter(is.na(age)) %>% pull(sample_id)
+```
+
+```{r}
+# But X210213 is listed as age 33 in csv file
+index <- which(rwh_rna_phenotype$sample_id == "X210213")
+rwh_rna_phenotype[index, "age"] <- 33
+```
+
+```{r}
+ggplot(rwh_rna_phenotype, aes(x=transformed_time_2, y=model_time)) +
+  geom_point()
+```
+
+```{r}
+pca <- prcomp(t(combat_nc[,rwh_rna_phenotype$sample_id]), scale.=FALSE)$x[,1:4]
+pca <- as.data.frame(pca) %>% tibble::rownames_to_column("sample_id") %>%
+  merge(rwh_rna_phenotype, by="sample_id")
+
+ggplot(pca, aes(x=PC1, y=PC2, color=model_time)) +
+  geom_point() +
+  scale_colour_gradientn(limits=c(0,100), colors=rainbow(20)[2:19])
+```
+
+-----
+
+
+# RNA-seq + GSE141549
+
+## Expression data
+
+```{r}
+probe_info <- all_probe_annotation %>%
+  filter(illumina_id %in% rownames(all_gse_matrix),
+         ! is.na(ensembl_reannotated),
+         str_detect(probe_quality, "Good|Perfect")) %>%
+  mutate(mean_exprs=rowMeans(all_gse_matrix[illumina_id,]))
+
+# If multiple ensembl IDs, use the one with highest expression...
+# There can only be one
+highlander <- probe_info %>% arrange(desc(mean_exprs)) %>% 
+  filter(! duplicated(ensembl_reannotated)) %>% pull(illumina_id)
+
+probe_info <- probe_info %>%
+  filter(illumina_id %in% highlander)
+
+gse_matrix <- all_gse_matrix[probe_info$illumina_id,]
+
+dim(probe_info)
+dim(all_gse_matrix)
+dim(gse_matrix)
+```
+
+
+
+```{r}
+y <- qld_counts_list$counts[,rwh_rna_phenotype$sample_id]
+y <- y[rowMeans(cpm(y) > 0.5) > 0.2,]
+dim(y)
+stopifnot(dim(y) == dim(combat_nc))
+
+y <- DGEList(counts=y)
+y <- calcNormFactors(y)
+nc <- cpm(y, normalized.lib.sizes=TRUE, log=TRUE)
+stopifnot(colnames(y) == colnames(combat_nc))
+stopifnot(rownames(y) == rownames(combat_nc))
+```
+
+
+```{r}
+annotation <- all_annotations %>%
+  select(ensembl_gene_id:hgnc_symbol)
+table(table(annotation$ensembl_gene_id))
+annotation <- annotation[! duplicated(annotation$ensembl_gene_id),]
+```
+
+
+-----
+
+
+## DGE: GSE Array only
+
+```{r}
+array_results <- list()
+array_numbers <- list()
+```
+
+```{r}
+all_endometrium_samples <- endometrium_samples
+```
+
+```{r}
+endometrium_samples <- endometrium_samples %>%
+  filter(cycle_phase != "medication")
+```
+
+### All stages
+
+```{r}
+pheno <- endometrium_samples
+dim(pheno)
+```
+
+```{r}
+X <- cSplineDes(pheno$model_time, knots=seq(0, 100, length=10))[,-9]
+design <- model.matrix(~age + X, data=pheno)
+fit <- lmFit(gse_matrix[,pheno$sample_id], design=design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=probe_info, by="illumina_id")
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=50)
+```
+
+```{r}
+array_results[["all"]] <- top
+array_numbers[["all"]] <- nrow(pheno)
+```
+
+
+### Menstral
+
+```{r}
+pheno <- endometrium_samples %>% 
+  filter(model_time %>% between(0,7.999999))
+dim(pheno)
+```
+
+
+```{r}
+design <- model.matrix(~age +
+                         ns(model_time, df=2, Boundary.knots=c(0,8)),
+                       data=pheno)
+fit <- lmFit(gse_matrix[,pheno$sample_id], design=design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=probe_info, by="illumina_id")
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=50)
+```
+
+```{r}
+array_results[["m"]] <- top
+array_numbers[["m"]] <- nrow(pheno)
+```
+
+
+### Proliferative
+
+```{r}
+pheno <- endometrium_samples %>% 
+  filter(model_time %>% between(8,57.999999))
+dim(pheno)
+```
+
+
+```{r}
+design <- model.matrix(~age + 
+                         ns(model_time, df=2, Boundary.knots=c(8, 58)),
+                       data=pheno)
+fit <- lmFit(gse_matrix[,pheno$sample_id], design=design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=probe_info, by="illumina_id")
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=50)
+```
+
+```{r}
+array_results[["p"]] <- top
+array_numbers[["p"]] <- nrow(pheno)
+```
+
+### Secretory
+
+```{r}
+pheno <- endometrium_samples %>% 
+  filter(model_time %>% between(58,100))
+dim(pheno)
+```
+
+```{r}
+design <- model.matrix(~age +
+                         ns(model_time, df=2, Boundary.knots=c(58,100)),
+                       data=pheno)
+fit <- lmFit(gse_matrix[,pheno$sample_id], design=design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=probe_info, by="illumina_id")
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=50)
+```
+
+```{r}
+array_results[["s"]] <- top
+array_numbers[["s"]] <- nrow(pheno)
+```
+
+
+## DGE: RNA-seq alone
+
+```{r}
+rna_results <- list()
+rna_numbers <- list()
+```
+
+```{r}
+rwh_rna_phenotype <- rwh_rna_phenotype %>%
+  mutate(endest=model_time)
+```
+
+
+```{r}
+# Use transformed_time_2 or endest time? Doesn't matter much either way
+rwh_rna_phenotype <- rwh_rna_phenotype %>%
+  mutate(
+         model_time=transformed_time_2
+  )
+```
+
+
+### All stages
+
+```{r}
+pheno <- rwh_rna_phenotype %>% filter(! is.na(age))
+dim(pheno)
+```
+
+```{r}
+exprs <- y[,pheno$sample_id]
+X <- cSplineDes(pheno$model_time, knots=seq(0, 100, length=10))[,-9]
+design <- model.matrix(~age + batch + X, pheno)
+fit <- voom(exprs, design, plot=TRUE)
+fit <- lmFit(fit, design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=annotation)
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=50)
+```
+
+```{r}
+head(top)
+```
+
+```{r}
+rna_results[["all"]] <- top
+rna_numbers[["all"]] <- nrow(pheno)
+```
+
+### Menstrual
+
+```{r}
+pheno <- rwh_rna_phenotype %>%
+  filter(! is.na(age)) %>%
+  mutate(age=as.numeric(age)) %>%
+  filter(cycle == "menstrual")
+```
+
+```{r}
+dim(pheno)
+```
+
+```{r}
+# plot(density(pheno$age))
+```
+
+```{r}
+exprs <- y[,pheno$sample_id]
+design <- model.matrix(
+  ~age + batch + ns(model_time, df=2, Boundary.knots=c(0,8)), pheno)
+fit <- voom(exprs, design, plot=FALSE)
+fit <- lmFit(fit, design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=annotation)
+head(top, 20)
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=50)
+```
+
+```{r}
+rna_results[["m"]] <- top
+rna_numbers[["m"]] <- nrow(pheno)
+```
+
+### Proliferative
+
+```{r}
+pheno <- rwh_rna_phenotype %>%
+  filter(! is.na(age)) %>%
+  mutate(age=as.numeric(age)) %>%
+  filter(cycle == "proliferative")
+```
+
+```{r}
+dim(pheno)
+```
+
+```{r}
+# plot(density(pheno$age))
+```
+
+```{r}
+exprs <- y[,pheno$sample_id]
+design <- model.matrix(
+  ~age + batch + ns(model_time, df=2, Boundary.knots=c(8,58)), pheno)
+fit <- voom(exprs, design, plot=FALSE)
+fit <- lmFit(fit, design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=annotation)
+head(top, 20)
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=50)
+```
+
+```{r}
+rna_results[["p"]] <- top
+rna_numbers[["p"]] <- nrow(pheno)
+```
+
+### Secretory
+
+```{r}
+pheno <- rwh_rna_phenotype %>%
+  filter(! is.na(age)) %>%
+  mutate(age=as.numeric(age)) %>%
+  filter(cycle == "secretory")
+```
+
+```{r}
+dim(pheno)
+```
+
+```{r}
+# plot(density(pheno$age))
+```
+
+```{r}
+exprs <- y[,pheno$sample_id]
+design <- model.matrix(
+  ~age + batch + ns(model_time, df=2, Boundary.knots=c(58,100)), pheno)
+fit <- voom(exprs, design, plot=FALSE)
+fit <- lmFit(fit, design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=annotation)
+head(top, 20)
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=50)
+```
+
+```{r}
+rna_results[["s"]] <- top
+rna_numbers[["s"]] <- nrow(pheno)
+```
+
+-----
+
+## Combine
+
+```{r}
+combined_results <- list()
+```
+
+```{r}
+table(rna_results[["all"]]$ensembl_gene_id %in%
+        array_results[["all"]]$ensembl_reannotated)
+```
+
+### All stages
+
+```{r}
+top <- merge(
+  rna_results[["all"]],
+  array_results[["all"]],
+  by.x="ensembl_gene_id", by.y="ensembl_reannotated",
+  suffix=c(".rwh", ".gse"))
+dim(top)
+```
+
+```{r}
+w <- c(rna_numbers[["all"]], array_numbers[["all"]])
+w
+```
+
+```{r}
+fisher_df <- top %>%
+  rowwise() %>%
+  mutate(fisher_p=wFisher(c(P.Value.rwh, P.Value.gse), weight=w,
+                          eff.sign=c(logFC.rwh, logFC.gse), is.onetail=FALSE)$p) %>%
+  mutate(stouffer_p=wZ(c(P.Value.rwh, P.Value.gse), weight=w,
+                      eff.sign=c(logFC.rwh, logFC.gse), is.onetail=FALSE)$p) %>%
+  ungroup() %>%
+  mutate(fisher_p_adj=p.adjust(fisher_p, method="fdr")) %>%
+  mutate(stouffer_p_adj=p.adjust(stouffer_p, method="fdr"))
+
+fisher_df <- fisher_df %>%
+  mutate(p_adj_rwh=p.adjust(P.Value.rwh, method="fdr"),
+         p_adj_gse=p.adjust(P.Value.gse, method="fdr"))
+```
+
+```{r}
+table(fisher_df$fisher_p_adj < 0.05)
+table(fisher_df$stouffer_p_adj < 0.05)
+
+table(rna_results[["all"]]$adj.P.Val < 0.05)
+table(fisher_df$p_adj_rwh < 0.05)
+
+table(array_results[["all"]]$adj.P.Val < 0.05)
+table(fisher_df$p_adj_gse < 0.05)
+
+# hist(fisher_df$P.Value.rwh, breaks=50)
+# hist(fisher_df$P.Value.gse, breaks=50)
+hist(fisher_df$fisher_p, breaks=50)
+```
+
+```{r}
+combined_results[["all"]] <- fisher_df
+```
+
+
+### Menstrual
+
+```{r}
+top <- merge(
+  rna_results[["m"]],
+  array_results[["m"]],
+  by.x="ensembl_gene_id", by.y="ensembl_reannotated",
+  suffix=c(".rwh", ".gse"))
+dim(top)
+```
+
+```{r}
+w <- c(rna_numbers[["m"]], array_numbers[["m"]])
+w
+```
+
+```{r}
+fisher_df <- top %>%
+  rowwise() %>%
+  mutate(fisher_p=wFisher(c(P.Value.rwh, P.Value.gse), weight=w,
+                          eff.sign=c(logFC.rwh, logFC.gse), is.onetail=FALSE)$p) %>%
+  mutate(stouffer_p=wZ(c(P.Value.rwh, P.Value.gse), weight=w,
+                      eff.sign=c(logFC.rwh, logFC.gse), is.onetail=FALSE)$p) %>%
+  ungroup() %>%
+  mutate(fisher_p_adj=p.adjust(fisher_p, method="fdr")) %>%
+  mutate(stouffer_p_adj=p.adjust(stouffer_p, method="fdr"))
+
+fisher_df <- fisher_df %>%
+  mutate(p_adj_rwh=p.adjust(P.Value.rwh, method="fdr"),
+         p_adj_gse=p.adjust(P.Value.gse, method="fdr"))
+```
+
+```{r}
+table(fisher_df$fisher_p_adj < 0.05)
+table(fisher_df$stouffer_p_adj < 0.05)
+
+table(rna_results[["m"]]$adj.P.Val < 0.05)
+table(fisher_df$p_adj_rwh < 0.05)
+
+table(array_results[["m"]]$adj.P.Val < 0.05)
+table(fisher_df$p_adj_gse < 0.05)
+
+# hist(fisher_df$P.Value.rwh, breaks=50)
+# hist(fisher_df$P.Value.gse, breaks=50)
+hist(fisher_df$fisher_p, breaks=50)
+```
+
+```{r}
+combined_results[["m"]] <- fisher_df
+```
+
+
+### Proliferative
+
+```{r}
+top <- merge(
+  rna_results[["p"]],
+  array_results[["p"]],
+  by.x="ensembl_gene_id", by.y="ensembl_reannotated",
+  suffix=c(".rwh", ".gse"))
+dim(top)
+```
+
+```{r}
+w <- c(rna_numbers[["p"]], array_numbers[["p"]])
+w
+```
+
+```{r}
+fisher_df <- top %>%
+  rowwise() %>%
+  mutate(fisher_p=wFisher(c(P.Value.rwh, P.Value.gse), weight=w,
+                          eff.sign=c(logFC.rwh, logFC.gse), is.onetail=FALSE)$p) %>%
+  mutate(stouffer_p=wZ(c(P.Value.rwh, P.Value.gse), weight=w,
+                      eff.sign=c(logFC.rwh, logFC.gse), is.onetail=FALSE)$p) %>%
+  ungroup() %>%
+  mutate(fisher_p_adj=p.adjust(fisher_p, method="fdr")) %>%
+  mutate(stouffer_p_adj=p.adjust(stouffer_p, method="fdr"))
+
+fisher_df <- fisher_df %>%
+  mutate(p_adj_rwh=p.adjust(P.Value.rwh, method="fdr"),
+         p_adj_gse=p.adjust(P.Value.gse, method="fdr"))
+```
+
+```{r}
+table(fisher_df$fisher_p_adj < 0.05)
+table(fisher_df$stouffer_p_adj < 0.05)
+
+table(rna_results[["p"]]$adj.P.Val < 0.05)
+table(fisher_df$p_adj_rwh < 0.05)
+
+table(array_results[["p"]]$adj.P.Val < 0.05)
+table(fisher_df$p_adj_gse < 0.05)
+
+# hist(fisher_df$P.Value.rwh, breaks=50)
+# hist(fisher_df$P.Value.gse, breaks=50)
+hist(fisher_df$fisher_p, breaks=50)
+```
+
+```{r}
+combined_results[["p"]] <- fisher_df
+```
+
+
+### Secretory
+
+```{r}
+top <- merge(
+  rna_results[["s"]],
+  array_results[["s"]],
+  by.x="ensembl_gene_id", by.y="ensembl_reannotated",
+  suffix=c(".rwh", ".gse"))
+dim(top)
+```
+
+```{r}
+w <- c(rna_numbers[["s"]], array_numbers[["s"]])
+w
+```
+
+```{r}
+fisher_df <- top %>%
+  rowwise() %>%
+  mutate(fisher_p=wFisher(c(P.Value.rwh, P.Value.gse), weight=w,
+                          eff.sign=c(logFC.rwh, logFC.gse), is.onetail=FALSE)$p) %>%
+  mutate(stouffer_p=wZ(c(P.Value.rwh, P.Value.gse), weight=w,
+                      eff.sign=c(logFC.rwh, logFC.gse), is.onetail=FALSE)$p) %>%
+  ungroup() %>%
+  mutate(fisher_p_adj=p.adjust(fisher_p, method="fdr")) %>%
+  mutate(stouffer_p_adj=p.adjust(stouffer_p, method="fdr"))
+
+fisher_df <- fisher_df %>%
+  mutate(p_adj_rwh=p.adjust(P.Value.rwh, method="fdr"),
+         p_adj_gse=p.adjust(P.Value.gse, method="fdr"))
+```
+
+```{r}
+table(fisher_df$fisher_p_adj < 0.05)
+table(fisher_df$stouffer_p_adj < 0.05)
+
+table(rna_results[["s"]]$adj.P.Val < 0.05)
+table(fisher_df$p_adj_rwh < 0.05)
+
+table(array_results[["s"]]$adj.P.Val < 0.05)
+table(fisher_df$p_adj_gse < 0.05)
+
+# hist(fisher_df$P.Value.rwh, breaks=50)
+# hist(fisher_df$P.Value.gse, breaks=50)
+hist(fisher_df$fisher_p, breaks=50)
+```
+
+```{r}
+combined_results[["s"]] <- fisher_df
+```
+
+
+## Overlapping genes
+
+```{r}
+ggvenn(list(
+  `All Stages`=combined_results[["all"]] %>% filter(fisher_p_adj < 0.05) %>%
+    pull(ensembl_gene_id),
+  `Secretory stage`=combined_results[["s"]] %>% filter(fisher_p_adj < 0.05) %>%
+    pull(ensembl_gene_id)
+), stroke_size = 0.3)
+```
+
+```{r}
+# All stages
+ggvenn(list(
+  `RWH`=combined_results[["all"]] %>% filter(p_adj_rwh < 0.05) %>%
+    pull(ensembl_gene_id),
+  `GSE141549`=combined_results[["all"]] %>% filter(p_adj_gse < 0.05) %>%
+    pull(ensembl_gene_id),
+  `Combined`=combined_results[["all"]] %>% filter(fisher_p_adj < 0.05) %>%
+    pull(ensembl_gene_id)
+), stroke_size = 0.3)
+```
+
+```{r}
+# Secretory
+ggvenn(list(
+  `RWH`=combined_results[["s"]] %>% filter(p_adj_rwh < 0.05) %>%
+    pull(ensembl_gene_id),
+  `GSE141549`=combined_results[["s"]] %>% filter(p_adj_gse < 0.05) %>%
+    pull(ensembl_gene_id),
+  `Combined`=combined_results[["s"]] %>% filter(fisher_p_adj < 0.05) %>%
+    pull(ensembl_gene_id)
+), stroke_size = 0.3)
+```
+
+## Save
+
+```{r}
+save(array_results, array_numbers,
+     rna_results, rna_numbers,
+     combined_results,
+     all_endometrium_samples, endometrium_samples,
+     rwh_rna_phenotype,
+     file=here::here("cache/1.10_results.rda"))
+```
+
+-----
+
+# Over representation analysis
+
+### All stages
+
+```{r}
+table(combined_results[["all"]]$fisher_p_adj < 0.05)
+```
+
+```{r}
+# Also need direction of effect for ORA. The vast majority that are significant
+# using fisher_p_adj are concordant for direction. But if not, one p-value is
+# much smaller than the other. So just get +ve or -ve logFC using smallest p
+
+combined_results[["all"]] %>% filter(fisher_p_adj < 0.05) %>%
+  filter((logFC.rwh * logFC.gse) < 0) %>%
+  select(contains("P.Value")) %>%
+  nrow
+```
+
+```{r}
+df <- combined_results[["all"]] %>%
+  mutate(adj.P.Val=fisher_p_adj) %>%
+  mutate(entrez_gene_id=as.character(entrez_gene_id)) %>%
+  mutate(logFC=ifelse(P.Value.rwh < P.Value.gse, logFC.rwh, logFC.gse))
+
+# Check
+# df %>% filter(adj.P.Val < 0.05, (logFC.rwh * logFC.gse) < 0)
+```
+
+```{r}
+ora_results <- run_ora(df,
+  run_kegg=TRUE, run_reactome=TRUE, p_threshold=0.05)
+```
+
+```{r}
+age_ora_results <- lapply(ora_results, function(x) {
+  x@result %>% filter(p.adjust < 0.05)
+})
+```
+
+```{r}
+sapply(age_ora_results, nrow)
+```
+
+```{r}
+age_ora_results[["up_go"]]
+```
+
+```{r}
+age_ora_results[["down_go"]]
+```
+
+```{r}
+age_ora_results[["up_kegg"]]
+```
+
+```{r}
+age_ora_results[["down_kegg"]]
+```
+
+```{r}
+age_ora_results[["up_reactome"]]
+```
+
+```{r}
+age_ora_results[["down_reactome"]]
+```
+
+```{r}
+saveRDS(age_ora_results, file=here::here("cache/1.10_ora_all.rds"))
+```
+
+### Secretory
+
+
+```{r}
+table(combined_results[["s"]]$fisher_p_adj < 0.05)
+```
+
+```{r}
+df <- combined_results[["s"]] %>%
+  mutate(adj.P.Val=fisher_p_adj) %>%
+  mutate(entrez_gene_id=as.character(entrez_gene_id)) %>%
+  mutate(logFC=ifelse(P.Value.rwh < P.Value.gse, logFC.rwh, logFC.gse))
+
+# Check
+# df %>% filter(adj.P.Val < 0.05, (logFC.rwh * logFC.gse) < 0)
+```
+
+```{r}
+ora_results <- run_ora(df,
+  run_kegg=TRUE, run_reactome=TRUE, p_threshold=0.05)
+```
+
+```{r}
+age_ora_results <- lapply(ora_results, function(x) {
+  x@result %>% filter(p.adjust < 0.05)
+})
+```
+
+```{r}
+sapply(age_ora_results, nrow)
+```
+
+```{r}
+age_ora_results[["up_go"]]
+```
+
+```{r}
+age_ora_results[["down_go"]]
+```
+
+```{r}
+age_ora_results[["up_kegg"]]
+```
+
+```{r}
+age_ora_results[["down_kegg"]]
+```
+
+```{r}
+age_ora_results[["up_reactome"]]
+```
+
+```{r}
+age_ora_results[["down_reactome"]]
+```
+
+```{r}
+saveRDS(age_ora_results, file=here::here("cache/1.10_ora_sec.rds"))
+```
+
+-----
+
+# Session info
+
+```{r}
+devtools::session_info()
+```
+

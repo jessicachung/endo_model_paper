@@ -1,0 +1,527 @@
+---
+title: "DGE"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+```{r}
+fit_spline_model <- function(y, x, spline_k=6, predict_range=seq(0,28,by=0.1),
+                             return_fit=TRUE) {
+  
+  tryCatch({
+    fit <- gam(y ~ s(x, bs="cc", k=spline_k), knots=list(x=seq(0,28,length=spline_k)))
+    fit_summary <- summary(fit)
+  }, error=function(e) {
+    fit <- NULL
+    warning("model not fitted.")
+  })
+  
+  pred <- predict(fit, newdata=data.frame(x=predict_range))
+  pred <- data.frame(cycle_time=predict_range, pred=pred)
+  
+  results <- list(pred=pred, 
+                  coefs=fit$coefficients,
+                  edf=round(fit_summary$edf, 3),
+                  R2=round(fit_summary$r.sq, 4),
+                  dev_exp=round(fit_summary$dev.expl, 4),
+                  s_table=fit_summary$s.table)
+  if (return_fit) results$fit <- fit
+  return(results)
+}
+
+plot_spline_model <- function(spline_list, y, x, gene_name="", alpha_point=1,
+                              alpha_line=0.5, jitter_height=0, jitter_width=0.05, 
+                              color="black", plot=TRUE) {
+  dat <- data.frame(exprs=y, cycle_time=x)
+  g <- ggplot(dat, aes(x=cycle_time, y=exprs)) +
+    geom_jitter(height=jitter_height, width=jitter_width, alpha=alpha_point, color=color) +
+    geom_line(spline_list$pred, mapping=aes(x=cycle_time, y=pred), alpha=alpha_line) +
+    labs(title=sprintf("%s | R^2 = %0.3f | edf = %0.2f", 
+                       gene_name, spline_list$R2, spline_list$edf))
+  if (! plot) return(g)
+  print(g)
+}
+```
+
+```{r}
+top_table_annotated <- function(fit, coef=2, n=6, annotation, by="ensembl_gene_id") {
+  if (length(coef) == 1) {
+    sort_by <- "p"
+  } else {
+    sort_by <- "F"
+  }
+  topTable(fit, coef=coef, n=n, sort.by=sort_by) %>%
+    tibble::rownames_to_column(var=by) %>%
+    merge(annotation, by=by, all.x=TRUE) %>%
+    arrange(P.Value) %>%
+    select(ensembl_gene_id, contains("logFC"), AveExpr:adj.P.Val,
+           ensembl_gene_id:hgnc_symbol)
+}
+```
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(purrr)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(splines)
+# library(org.Hs.eg.db)
+# library(clusterProfiler)
+# library(ReactomePA)
+
+select <- dplyr::select
+```
+
+```{r}
+qld_counts_list <- readRDS(here::here("data/tidy_data/qld_counts_list.rds"))
+sample_info <- readRDS(here::here("data/tidy_data/sample_info.rds"))
+all_annotations <- readRDS(here::here("data/tidy_data/all_annotations.rds"))
+```
+
+```{r}
+dataset_id <- "2021-03-23"
+combat_phenotype <- readRDS(here::here(sprintf("data/tidy_data/combat_phenotype_%s.rds", dataset_id)))
+combat_nc <- readRDS(here::here("data/tidy_data/batch_normalised_exprs.rds"))
+
+unique_id <- "2021-03-23_k30_g4"
+gene_models <- readRDS(here::here(sprintf("data/gene_models/gene_models_%s.rds", unique_id)))
+cycle_nc <- readRDS(here::here(sprintf("data/tidy_data/cycle_normalised_exprs_%s.rds", unique_id)))
+```
+
+
+-----
+
+# Get gene info
+
+```{r}
+m <- match(rownames(cycle_nc), all_annotations$ensembl_gene_id)
+annotation <- all_annotations[m,]
+```
+
+```{r}
+stopifnot(combat_phenotype$sample_id == colnames(cycle_nc))
+```
+
+```{r}
+# Originally filtered with: y[rowMeans(cpm(y) > 0.5) > 0.2,]
+dim(cycle_nc)
+```
+
+```{r}
+dim(combat_phenotype)
+```
+
+-----
+
+# Age DGE
+
+```{r}
+# X210213 is missing age in spreadsheet
+combat_phenotype %>% filter(is.na(age)) %>% pull(sample_id)
+```
+
+```{r}
+# But X210213 is listed as age 33 in csv file
+index <- which(combat_phenotype$sample_id == "X210213")
+combat_phenotype[index, "age"] <- 33
+```
+
+```{r}
+combat_phenotype <- combat_phenotype %>% 
+  mutate(age=as.numeric(age)) %>%
+  mutate(cycle=case_when(
+    transformed_time_2 %>% between(0,7.999999) ~ "menstrual",
+    transformed_time_2 %>% between(8,59.999999) ~ "proliferative",
+    transformed_time_2 %>% between(60,100) ~ "secretory",
+    TRUE ~ ""))
+table(combat_phenotype$cycle)
+```
+
+## All stages
+
+```{r}
+pheno <- combat_phenotype %>% filter(! is.na(age)) %>% mutate(age=as.numeric(age))
+dim(pheno)
+```
+
+```{r}
+exprs <- cycle_nc[,pheno$sample_id]
+design <- model.matrix(~age, pheno)
+fit <- lmFit(exprs, design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=annotation)
+table(top$adj.P.Val < 0.05)
+```
+
+```{r}
+hist(top$P.Value, breaks=50)
+```
+
+```{r}
+head(top)
+```
+
+```{r}
+# Save for later
+top_age <- top
+```
+
+
+## Age 3 stages (approx)
+
+### Menstrual
+
+```{r}
+pheno <- combat_phenotype %>%
+  filter(! is.na(age)) %>%
+  mutate(age=as.numeric(age)) %>%
+  filter(cycle == "menstrual")
+```
+
+```{r}
+dim(pheno)
+```
+
+```{r}
+exprs <- cycle_nc[,pheno$sample_id]
+design <- model.matrix(~age, pheno)
+fit <- lmFit(exprs, design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=annotation)
+head(top)
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=100)
+```
+
+
+```{r}
+top_lists <- list()
+top_lists[["menstrual"]] <- top
+```
+
+
+### Proliferative
+
+```{r}
+pheno <- combat_phenotype %>%
+  filter(! is.na(age)) %>%
+  mutate(age=as.numeric(age)) %>%
+  filter(cycle == "proliferative")
+```
+
+```{r}
+dim(pheno)
+```
+
+```{r}
+exprs <- cycle_nc[,pheno$sample_id]
+design <- model.matrix(~age, pheno)
+fit <- lmFit(exprs, design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=annotation)
+head(top)
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=100)
+```
+
+```{r}
+top_lists[["proliferative"]] <- top
+```
+
+### Secretory
+
+```{r}
+pheno <- combat_phenotype %>%
+  filter(! is.na(age)) %>%
+  mutate(age=as.numeric(age)) %>%
+  filter(cycle == "secretory")
+```
+
+```{r}
+dim(pheno)
+```
+
+```{r}
+plot(density(pheno$age))
+```
+
+```{r}
+exprs <- cycle_nc[,pheno$sample_id]
+design <- model.matrix(~age, pheno)
+fit <- lmFit(exprs, design)
+fit <- eBayes(fit)
+top <- top_table_annotated(fit, coef=2, n=Inf, annotation=annotation)
+head(top, 20)
+table(top$adj.P.Val < 0.05)
+hist(top$P.Value, breaks=100)
+```
+
+```{r, fig.height=2, fig.width=6}
+for (g in top$ensembl_gene_id[1:10]) {
+  dat <- combat_phenotype %>% 
+    mutate(exprs=cycle_nc[g, sample_id])
+  p <- ggplot(dat, aes(x=age, y=exprs)) +
+    geom_point(size=1.5) +
+    facet_grid(.~cycle) +
+    theme_bw() +
+    labs(title=g)
+  print(p)
+}
+```
+
+
+```{r}
+top_lists[["secretory"]] <- top
+```
+
+```{r}
+all_top <- rbind(
+  top_lists$menstrual %>% mutate(cycle="menstrual"),
+  top_lists$proliferative %>% mutate(cycle="proliferative"),
+  top_lists$secretory %>% mutate(cycle="secretory")
+) %>%
+  rename(adj.P.Val_one_test="adj.P.Val")
+all_top$adj_p <- p.adjust(all_top$P.Value, method="BH")
+hist(all_top$P.Value, breaks=50)
+```
+
+```{r}
+all_top %>% filter(adj_p < 0.05) %>% nrow
+all_top %>% filter(adj_p < 0.05) %>% pull(ensembl_gene_id) %>% unique %>% length
+```
+
+```{r paged.print=TRUE}
+all_top %>% arrange(adj_p) %>% head(50)
+```
+
+```{r}
+age_all_top <- all_top %>% arrange(P.Value)
+age_top_list <- top_lists
+```
+
+## Write to file
+
+```{r}
+saveRDS(top_age %>% filter(adj.P.Val < 0.05), here::here("cache/fig5_age_sig_list.rds"))
+
+write.table(top_age %>% head(100) %>% select(ensembl_gene_id, hgnc_symbol, 
+                                         entrez_gene_id, everything(), -B), 
+            file=here::here("output/dge_list/age.txt"), 
+            row.names=FALSE, quote=FALSE, sep="\t")
+```
+
+```{r}
+saveRDS(age_all_top,
+        here::here("cache/dge_age_stages.rds"))
+
+write.table(age_all_top %>% filter(cycle == "menstrual") %>% head(100) %>%
+              select(ensembl_gene_id, hgnc_symbol, 
+                     entrez_gene_id, everything(), -B), 
+            file=here::here("output/dge_list/age_menstrual.txt"), 
+            row.names=FALSE, quote=FALSE, sep="\t")
+
+write.table(age_all_top %>% filter(cycle == "proliferative") %>% head(100) %>%
+              select(ensembl_gene_id, hgnc_symbol, 
+                     entrez_gene_id, everything(), -B), 
+            file=here::here("output/dge_list/age_proliferative.txt"), 
+            row.names=FALSE, quote=FALSE, sep="\t")
+
+write.table(age_all_top %>% filter(cycle == "secretory") %>% head(200) %>%
+              select(ensembl_gene_id, hgnc_symbol, 
+                     entrez_gene_id, everything(), -B), 
+            file=here::here("output/dge_list/age_secretory.txt"), 
+            row.names=FALSE, quote=FALSE, sep="\t")
+
+write.table(age_all_top %>% filter(adj_p < 0.05) %>%
+              select(ensembl_gene_id, hgnc_symbol, 
+                     entrez_gene_id, everything(), -B), 
+            file=here::here("output/dge_list/age_stages_sig.txt"), 
+            row.names=FALSE, quote=FALSE, sep="\t")
+```
+
+-----
+
+# Ancestry
+
+```{r}
+pheno <- combat_phenotype %>%
+  filter(! is.na(ancestry), ! is.na(age)) %>%
+  mutate(age=as.numeric(age))
+
+table(sample_info$ancestry, useNA="always")
+table(pheno$ancestry)
+dim(pheno)
+```
+
+Is "NA" north america or N/A?
+
+```{r}
+# Assume NA is <NA> and not North America from looking at the end tables in the spreadsheet.
+pheno <- pheno %>% filter(ancestry != "NA")
+dim(pheno)
+```
+
+
+```{r}
+ancestry_groups <- sort(unique(pheno$ancestry))
+dge_ancestry_results <- list()
+for (a in ancestry_groups) {
+  ancestry_levels <- unique(c(a, ancestry_groups))
+  ancestry_pheno <- pheno %>% 
+    mutate(ancestry=factor(ancestry, levels=ancestry_levels))
+  design <- model.matrix(~ancestry+age, ancestry_pheno)
+  colnames(design) <- str_replace(colnames(design), "^ancestry", "")
+  fit <- lmFit(cycle_nc[,ancestry_pheno$sample_id], design)
+  fit <- eBayes(fit)
+  for (b in colnames(design)[2:length(ancestry_levels)]) {
+    top <- top_table_annotated(fit, coef=b, n=Inf, annotation=annotation)
+    dge_ancestry_results[[paste0(a, "_vs_", b)]] <- top
+  }
+}
+```
+
+```{r}
+# Remove duplicate permutations, e.g A_vs_B and B_vs_A
+all_comparisons <- names(dge_ancestry_results)
+keep <- c()
+for (comparison in all_comparisons) {
+  m <- str_match(comparison, "^(.+)_vs_(.+)$")
+  if (which(ancestry_groups == m[2]) < which(ancestry_groups == m[3])) {
+    keep <- c(keep, comparison)
+  }
+}
+keep
+```
+
+```{r}
+dge_ancestry_results <- dge_ancestry_results[keep]
+```
+
+
+```{r}
+sapply(dge_ancestry_results, function(x) x %>% filter(adj.P.Val < 0.05) %>% nrow)
+```
+
+```{r}
+combined_dge <- do.call(rbind, dge_ancestry_results) %>%
+  tibble::rownames_to_column("comparison") %>%
+  mutate(comparison=str_remove(comparison, "\\.\\d+$"))
+
+hist(combined_dge$P.Value, breaks=50)
+```
+
+
+```{r}
+combined_dge$adj_p <- p.adjust(combined_dge$P.Value, method="BH")
+sig_list <- combined_dge %>% filter(adj_p < 0.05)
+nrow(sig_list)
+```
+
+```{r}
+# Number of unique gene IDs in significant gene list
+sig_list$ensembl_gene_id %>% unique %>% length
+```
+
+```{r}
+sig_list %>% group_by(comparison) %>% summarise(n=n())
+```
+
+```{r paged.print=TRUE}
+sig_list %>% arrange(adj_p) %>% head
+```
+
+## Write to file
+
+```{r}
+saveRDS(sig_list, here::here("cache/fig5_ancestry_sig_list.rds"))
+```
+
+```{r}
+write.table(sig_list %>% select(comparison, ensembl_gene_id, hgnc_symbol, 
+                                         entrez_gene_id, everything(), -B), 
+            file=here::here("output/dge_list/ancestry_sig.txt"), 
+            row.names=FALSE, quote=FALSE, sep="\t")
+```
+
+## Plots
+
+```{r}
+g <- "ENSG00000265185"
+a <- "EAS"
+b <- "EUR"
+dat <- combat_phenotype %>% 
+  filter(ancestry %in% c(a, b)) %>%
+  mutate(exprs=cycle_nc[g, sample_id])
+ggplot(dat, aes(x=ancestry, y=exprs)) +
+  geom_boxplot(outlier.shape=NA) +
+  geom_jitter(width=0.05, height=0, size=0.5)
+```
+
+
+```{r}
+g <- "ENSG00000243918"
+a <- "AFR"
+b <- "EUR"
+dat <- combat_phenotype %>% 
+  filter(ancestry %in% c(a, b)) %>%
+  mutate(exprs=cycle_nc[g, sample_id])
+ggplot(dat, aes(x=ancestry, y=exprs)) +
+  geom_boxplot(outlier.shape=NA) +
+  geom_jitter(width=0.05, height=0, size=0.5)
+```
+
+```{r}
+# dge_ancestry_results[["AFR_vs_EUR"]]
+g <- "ENSG00000243918"
+# g <- "ENSG00000217455"
+cycle_time <- combat_phenotype$transformed_time_2
+col <- ifelse(combat_phenotype$ancestry == "AFR", "red", "grey")
+col <- ifelse(combat_phenotype$ancestry == "EUR", "blue", col)
+plot_spline_model(gene_models[[g]],
+                  y=combat_nc[g,], x=cycle_time, color=col,
+                  gene_name = g, plot=FALSE)
+```
+
+
+```{r}
+# dge_ancestry_results[["EUR_vs_EAS"]]
+cycle_time <- combat_phenotype$transformed_time_2
+col <- ifelse(combat_phenotype$ancestry == "EAS", "red", "grey")
+col <- ifelse(combat_phenotype$ancestry == "EUR", "blue", col)
+g <- "ENSG00000265185"
+# g <- "ENSG00000259520"
+plot_spline_model(gene_models[[g]],
+                  y=combat_nc[g,], x=cycle_time, color=col,
+                  gene_name = g, plot=FALSE)
+```
+
+
+
+-----
+
+# Session Info
+
+```{r}
+devtools::session_info()
+```
+

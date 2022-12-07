@@ -1,0 +1,149 @@
+---
+title: "Counts EDA"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+#library(gridExtra)
+#library(purrr)
+library(edgeR)
+library(limma)
+library(ggplot2)
+```
+
+```{r}
+qld_counts_list <- readRDS("data/tidy_data/qld_counts_list.rds")
+```
+
+-----
+
+# Endo plots
+
+```{r}
+y <- qld_counts_list$counts
+y <- y[rowMeans(cpm(y) >1) > 0.2,]
+dim(y)
+
+y <- DGEList(counts=y)
+y <- calcNormFactors(y)
+nc <- cpm(y, normalized.lib.sizes=TRUE, log=TRUE)
+```
+
+## Sequencing depth
+
+```{r}
+ggplot(data.frame(lib_size=y$samples$lib.size), aes(x=lib_size)) +
+  geom_histogram(bins=30, color=1, alpha=0.8) +
+  theme_bw()
+```
+
+
+## Boxplots
+
+```{r}
+boxplot(nc[,1:100], las=2, cex=0.5, cex.axis=0.5, ylim=c(-5,20))
+boxplot(nc[,101:200], las=2, cex=0.5, cex.axis=0.5, ylim=c(-5,20))
+boxplot(nc[,201:295], las=2, cex=0.5, cex.axis=0.5, ylim=c(-5,20))
+```
+
+## RLE plots
+
+```{r}
+gene_medians <- apply(nc, 1, median)
+rle <- sweep(nc, 1, gene_medians)
+```
+
+```{r}
+boxplot(rle[,1:100], las=2, cex=0.5, cex.axis=0.5, outline=FALSE, ylim=c(-2.5,2.5))
+abline(h=0, col="red", lty=2)
+boxplot(rle[,101:200], las=2, cex=0.5, cex.axis=0.5, outline=FALSE, ylim=c(-2.5,2.5))
+abline(h=0, col="red", lty=2)
+boxplot(rle[,201:295], las=2, cex=0.5, cex.axis=0.5, outline=FALSE, ylim=c(-2.5,2.5))
+abline(h=0, col="red", lty=2)
+```
+
+## PCA plots
+
+```{r}
+pca <- prcomp(t(nc))
+pca <- data.frame(pca$x[,1:6]) %>% tibble::rownames_to_column("sample_id")
+ggplot(pca, aes(x=PC1, y=PC2, label=sample_id)) +
+  geom_text(size=2) +
+  theme_bw()
+```
+
+```{r}
+pca <- pca %>% mutate(urs=str_detect(sample_id, "URS"))
+ggplot(pca, aes(x=PC1, y=PC2, label=sample_id, color=urs)) +
+  geom_point() +
+  theme_bw()
+```
+
+```{r}
+# Look at samples from the same patient 
+base_sample_id <- str_extract(pca$sample_id, "X\\d+|URS\\d+")
+pca$base_sample_id <- base_sample_id
+reps <- base_sample_id[duplicated(base_sample_id)]
+
+ggplot(pca %>% filter(base_sample_id %in% reps), 
+       aes(x=PC1, y=PC2, label=sample_id, color=base_sample_id)) +
+  geom_text(size=3) +
+  theme_bw()
+```
+
+```{r}
+ggplot(pca %>% filter(base_sample_id %in% reps), 
+       aes(x=PC2, y=PC3, label=sample_id, color=base_sample_id)) +
+  geom_text(size=3) +
+  theme_bw()
+```
+
+
+```{r}
+# Even though X210075 replicates aren't highly correlated with each other,
+# they're still near each other in the first few PCs.
+pca %>% filter(base_sample_id == "X210075")
+```
+
+Look for batch effects.
+
+```{r}
+merge(pca, qld_counts_list$sample_info, by="sample_id") %>%
+  mutate(batch=sprintf("%d_%d", sequencing_batch, flowcell_batch)) %>%
+  ggplot(aes(x=PC4, y=PC5, label=sample_id, color=batch)) +
+  geom_point() +
+  theme_bw()
+```
+
+Can see batch effect for batch 1 (i.e the 120bp library) in PC4 and PC5.
+
+-----
+
+# Session Info
+
+```{r}
+devtools::session_info()
+```
+
+

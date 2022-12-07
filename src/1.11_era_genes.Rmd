@@ -1,0 +1,309 @@
+---
+title: "Check ERA genes"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(purrr)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(splines)
+library(patchwork)
+select <- dplyr::select
+```
+
+```{r}
+qld_counts_list <- readRDS(here::here("data/tidy_data/qld_counts_list.rds"))
+sample_info <- readRDS(here::here("data/tidy_data/sample_info.rds"))
+all_annotations <- readRDS(here::here("data/tidy_data/all_annotations.rds"))
+combat_nc <- readRDS(here::here("data/tidy_data/batch_normalised_exprs.rds"))
+```
+
+```{r}
+dataset_id <- "2021-03-23"
+combat_phenotype <- readRDS(here::here(sprintf("data/tidy_data/combat_phenotype_%s.rds", dataset_id)))
+
+unique_id <- "2021-03-23_k30_g4"
+gene_models <- readRDS(here::here(sprintf("data/gene_models/gene_models_%s.rds", unique_id)))
+```
+
+
+# ERA paper
+
+
+```{r}
+# ERA gene list comparison
+era_df <- read.table(here::here("data/ext_data/era_gene_list.tsv"), 
+                     sep="\t", header=1, stringsAsFactors=FALSE)
+subset_annotation <- all_annotations %>% 
+  filter(ensembl_gene_id %in% rownames(combat_nc),
+         hgnc_symbol %in% era_df$gene_symbol,
+         hgnc_symbol != "")
+
+subset_annotation <- merge(
+  era_df, subset_annotation, 
+  by.x="gene_symbol", by.y="hgnc_symbol"
+) %>%
+  select(gene_symbol:description)
+nrow(subset_annotation)
+```
+
+```{r}
+phenotype <- combat_phenotype %>% 
+  select(sample_id, transformed_time, age) %>%
+  filter(! is.na(transformed_time)) %>% 
+  arrange(transformed_time) %>%
+  mutate(age=as.numeric(age))
+dim(phenotype)
+```
+
+```{r}
+# Manually insert missing age in sample 210213
+phenotype %>% filter(is.na(age))
+index <- which(phenotype$sample_id == "X210213")
+phenotype[index, "age"] <- 33
+```
+
+### From 66 - 76
+
+```{r}
+use_treat <- TRUE
+lfc_threshold <- log2(1.2)
+```
+
+```{r paged.print=TRUE}
+a <- phenotype %>% filter(transformed_time %>% between(66-2, 66+2)) %>%
+  mutate(group="a")
+b <- phenotype %>% filter(transformed_time %>% between(76-2, 76+2)) %>%
+  mutate(group="b")
+pheno <- rbind(a, b)
+pheno %>% arrange(transformed_time)
+```
+
+
+```{r}
+#design <- model.matrix(~group, pheno)
+design <- model.matrix(~group + age, pheno)
+exprs <- combat_nc[,pheno$sample_id]
+fit <- lmFit(exprs, design)
+if (use_treat) {
+  fit <- treat(fit, lfc=lfc_threshold)
+} else {
+  fit <- eBayes(fit)
+}
+top_table <- topTable(fit, coef=2, n=Inf, sort.by="p") %>%
+  tibble::rownames_to_column("gene_id")
+n_sig <- top_table %>% filter(adj.P.Val < 0.05) %>% nrow
+n_sig
+```
+
+
+```{r paged.print=TRUE}
+# Top 50
+top_table %>% filter(adj.P.Val < 0.05) %>% head(50) %>%
+  merge(all_annotations %>% 
+          select(ensembl_gene_id, hgnc_symbol),
+        by.x="gene_id", by.y="ensembl_gene_id", all.x=TRUE) %>%
+  arrange(P.Value)
+```
+
+
+```{r paged.print=TRUE}
+# Last 100
+top_table %>% filter(adj.P.Val < 0.05) %>% tail(100) %>%
+  merge(all_annotations %>% 
+          select(ensembl_gene_id, hgnc_symbol),
+        by.x="gene_id", by.y="ensembl_gene_id", all.x=TRUE) %>%
+  arrange(P.Value)
+```
+
+```{r}
+table(top_table$gene_id %in% all_annotations$ensembl_gene_id)
+```
+
+```{r}
+top_common <- top_table %>% filter(adj.P.Val < 0.05) %>%
+  merge(subset_annotation, by.x="gene_id", by.y="ensembl_gene_id") %>%
+  arrange(adj.P.Val)
+nrow(top_common)
+```
+
+```{r}
+table((top_common$logFC > 0) == (top_common$fold_change > 0))
+```
+
+```{r}
+nrow(top_common)/nrow(subset_annotation)
+```
+
+```{r}
+# Including non-sig
+tmp <- top_table %>% 
+  merge(subset_annotation, by.x="gene_id", by.y="ensembl_gene_id") %>%
+  arrange(adj.P.Val)
+table((tmp$logFC > 0) == (tmp$fold_change > 0))
+```
+
+```{r}
+# Note, this uses treat with 1.5 fc threshold
+hist(tmp$adj.P.Val, breaks=50)
+```
+
+# Plots
+
+For supplementary figures
+
+```{r}
+fit_spline_model <- function(y, x, spline_k=6, spline_fx=FALSE, spline_bs="cc", 
+                             gamma=1, predict_range=seq(0,28,by=0.1), 
+                             weights=NULL, knots=NULL, return_coefs=FALSE,
+                             return_fit=TRUE) {
+  
+  fit <- gam(y ~ s(x, bs=spline_bs, k=spline_k, fx=spline_fx), 
+             knots=knots, weights=weights, gamma=gamma)
+  fit_summary <- summary(fit)
+  
+  pred <- predict(fit, newdata=data.frame(x=predict_range), se=TRUE)
+  pred <- data.frame(cycle_time=predict_range, pred=pred$fit, se=pred$se.fit)
+  
+  results <- list(pred=pred, 
+                  edf=round(fit_summary$edf, 3),
+                  R2=round(fit_summary$r.sq, 4),
+                  dev_exp=round(fit_summary$dev.expl, 4),
+                  s_table=fit_summary$s.table)
+  if (return_coefs) results$coefs <- fit$coefficients
+  if (return_fit) results$fit <- fit
+  return(results)
+}
+
+plot_spline_model <- function(spline_list, y, x, gene_name="", alpha_point=1,
+                              alpha_line=0.5, jitter_height=0, jitter_width=0.05, 
+                              plot=TRUE) {
+  dat <- data.frame(exprs=y, cycle_time=x)
+  dat2 <- spline_list$pred #%>%
+    # mutate(lower=pred - 1.96*se,
+    #        upper=pred + 1.96*se)
+  g <- ggplot() +
+    # geom_ribbon(dat2, mapping=aes(x=cycle_time, ymin=lower, ymax=upper),
+    #             fill="grey90") +
+    geom_jitter(dat, mapping=aes(x=cycle_time, y=exprs), height=jitter_height,
+                width=jitter_width, alpha=alpha_point) +
+    geom_line(dat2, mapping=aes(x=cycle_time, y=pred), alpha=alpha_line) +
+    theme_bw()# +
+    # labs(title=sprintf("%s | R^2 = %0.3f | edf = %0.2f", 
+    #                    gene_name, spline_list$R2, spline_list$edf))
+  if (! plot) return(g)
+  print(g)
+}
+```
+
+```{r}
+cycle_time <- round(combat_phenotype$transformed_time_2)
+k_knots <- 30
+spline_knots <- list(x=seq(0,100,length=k_knots))
+cycle_range <- seq(0, 100, by=1)
+```
+
+```{r}
+# Top 6 up and down-regulated
+top_up <- top_common %>% arrange(adj.P.Val) %>% filter(logFC > 0) %>% head(6)
+top_down <- top_common %>% arrange(adj.P.Val) %>% filter(logFC < 0) %>% head(6)
+```
+
+
+```{r}
+top_up_figs <- list()
+for (i in seq_len(nrow(top_up))) {
+  g <- top_up[i,1]
+  gene_name <- top_up[i, "gene_symbol"]
+  fig <- plot_spline_model(gene_models[[g]], x=cycle_time,
+                           y=combat_nc[g,], alpha_line=0,
+                           gene_name=g, jitter_width=0, 
+                           plot=FALSE) +
+    labs(title=sprintf("%s (%s)", gene_name, g), y=expression(log[2](CPM)), 
+         x="Model Time", parse=TRUE) +
+    theme(panel.grid = element_blank())
+  top_up_figs[[g]] <- fig
+}
+```
+
+
+```{r}
+top_up_figs
+```
+
+```{r}
+top_down_figs <- list()
+for (i in seq_len(nrow(top_down))) {
+  g <- top_down[i,1]
+  gene_name <- top_down[i, "gene_symbol"]
+  fig <- plot_spline_model(gene_models[[g]], x=cycle_time,
+                           y=combat_nc[g,], alpha_line=0,
+                           gene_name=g, jitter_width=0, 
+                           plot=FALSE) +
+    labs(title=sprintf("%s (%s)", gene_name, g), y=expression(log[2](CPM)), 
+         x="Model Time", parse=TRUE) +
+    theme(panel.grid = element_blank())
+  top_down_figs[[g]] <- fig
+}
+```
+
+```{r}
+top_down_figs
+```
+
+```{r}
+# Save as vector images
+fig_up_combined <- (top_up_figs[[1]] | top_up_figs[[2]]) /
+                   (top_up_figs[[3]] | top_up_figs[[4]]) /
+                   (top_up_figs[[5]] | top_up_figs[[6]])
+fig_up_combined
+```
+
+```{r}
+ggsave(here::here("figures/fig_sup_era_up.pdf"), 
+       plot=fig_up_combined, height=10, width=10)
+```
+
+```{r}
+fig_down_combined <- (top_down_figs[[1]] | top_down_figs[[2]]) /
+                     (top_down_figs[[3]] | top_down_figs[[4]]) /
+                     (top_down_figs[[5]] | top_down_figs[[6]])
+fig_down_combined
+```
+
+```{r}
+ggsave(here::here("figures/fig_sup_era_down.pdf"), 
+       plot=fig_down_combined, height=10, width=10)
+```
+
+
+# Session info
+
+```{r}
+devtools::session_info()
+```
+

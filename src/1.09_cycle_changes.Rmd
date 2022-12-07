@@ -1,0 +1,553 @@
+---
+title: "Genes that change a lot during the cycle"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+options(width=120)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+-----
+
+# Load
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(purrr)
+library(edgeR)
+library(limma)
+library(ggplot2)
+library(splines)
+
+# # For QuickGO REST API query
+# library(httr)
+# library(jsonlite)
+# library(xml2)
+# 
+# # To get gene lengths
+# library(goseq)
+
+# Additional GO/pathway analysis
+library(clusterProfiler)
+library(ReactomePA)
+
+select <- dplyr::select
+```
+
+
+
+```{r}
+qld_counts_list <- readRDS(here::here("data/tidy_data/qld_counts_list.rds"))
+sample_info <- readRDS(here::here("data/tidy_data/sample_info.rds"))
+all_annotations <- readRDS(here::here("data/tidy_data/all_annotations.rds"))
+combat_nc <- readRDS(here::here("data/tidy_data/batch_normalised_exprs.rds"))
+```
+
+```{r}
+dataset_id <- "2021-03-23"
+combat_phenotype <- readRDS(here::here(sprintf("data/tidy_data/combat_phenotype_%s.rds", dataset_id)))
+combat_nc <- readRDS(here::here("data/tidy_data/batch_normalised_exprs.rds"))
+
+unique_id <- "2021-03-23_k30_g4"
+gene_models <- readRDS(here::here(sprintf("data/gene_models/gene_models_%s.rds", unique_id)))
+cycle_nc <- readRDS(here::here(sprintf("data/tidy_data/cycle_normalised_exprs_%s.rds", unique_id)))
+```
+
+-----
+
+# Gene info
+
+```{r}
+phenotype <- combat_phenotype %>% 
+  select(sample_id, transformed_time, age) %>%
+  mutate(age=as.numeric(age)) %>%
+  filter(! is.na(transformed_time)) %>% 
+  arrange(transformed_time)
+dim(phenotype)
+```
+
+```{r}
+# Manually insert missing age in sample 210213
+phenotype %>% filter(is.na(age))
+index <- which(phenotype$sample_id == "X210213")
+phenotype[index, "age"] <- 33
+```
+
+
+```{r}
+ensembl_to_entrez <- as.character(all_annotations$entrez_gene_id)
+names(ensembl_to_entrez) <- all_annotations$ensembl_gene_id
+```
+
+```{r}
+all_genes <- rownames(combat_nc)
+entrez_ids <- all_annotations[match(all_genes, all_annotations$ensembl_gene_id),"entrez_gene_id"]
+stopifnot(length(gene_models) == length(all_genes))
+length(all_genes)
+```
+
+```{r}
+# gene_lengths <- getlength(all_genes,'hg19','ensGene')
+```
+
+```{r}
+probes <- names(gene_models)
+
+# Get probe R^2 values
+r2 <- sapply(probes, function(p) gene_models[[p]]$R2)
+
+# Get df for models
+spline_edf <- sapply(probes, function(p) gene_models[[p]]$edf)
+
+# Get deviance explained
+dev_exp <- sapply(probes, function(p) gene_models[[p]]$dev_exp)
+
+# Get p-values
+pvals <- sapply(probes, function(p) gene_models[[p]]$s_table[1,"p-value"])
+
+model_df <- data.frame(probe_id=probes, r2=r2, spline_edf=spline_edf, 
+                       dev_exp=dev_exp, p=pvals, # coefs,
+                       stringsAsFactors=FALSE)
+```
+
+-----
+
+# Deviance explained plots
+
+```{r}
+ggplot(model_df, aes(x=dev_exp)) +
+  geom_histogram(binwidth=0.05, color=1, fill="white") +
+  theme_bw()
+
+g <- ggplot(model_df, aes(x=r2)) +
+  geom_histogram(binwidth=0.05, color=1, fill="white") +
+  geom_vline(aes(xintercept=median(r2)), linetype="dashed", alpha=0.5, color="red") + 
+  scale_x_continuous(breaks=seq(0,1,0.2)) + 
+  theme_bw() +
+  labs(x="Adjusted R-squared", y="Number of Genes") + 
+  theme(panel.grid = element_blank())
+g
+```
+
+```{r}
+ggsave(filename=here::here("figures/adjusted_r_squared.pdf"),
+       plot=g, height=4, width=8)
+```
+
+
+```{r}
+# Adjusted R-squared is easier to explain than deviance explained
+# r.sq: The adjusted r-squared for the model. Defined as the proportion of variance explained, where original variance and residual variance are both estimated using unbiased estimators. This quantity can be negative if your model is worse than a one parameter constant model, and can be higher for the smaller of two nested models! The proportion null deviance explained is probably more appropriate for non-normal errors. Note that r.sq does not include any offset in the one parameter model.
+# dev.exp: The proportion of the null deviance explained by the model. The null deviance is computed taking account of any offset, so dev.expl can be substantially lower than r.sq when an offset is present.
+
+median(model_df$r2)
+
+mean(model_df$r2 > 0.5)
+table(model_df$r2 > 0.5)
+
+mean(model_df$r2 > 0.25)
+table(model_df$r2 > 0.25)
+```
+
+-----
+
+# GO Terms of interest
+
+```{r}
+# # ovulation cycle (BP)
+# # https://www.ebi.ac.uk/QuickGO/GTerm?id=GO:0042698
+# 
+# parent <- "GO:0042698" %>% str_replace(":", "%3A")
+# relations <- "is_a%2Cpart_of%2Coccurs_in%2Cregulates"
+# # requestURL <- sprintf("https://www.ebi.ac.uk/QuickGO/services/ontology/go/terms/%s/children", parent)
+# requestURL <- sprintf("https://www.ebi.ac.uk/QuickGO/services/ontology/go/terms/%s/descendants?relations=%s", 
+#                       parent, relations)
+# 
+# r <- GET(requestURL, accept("application/json"))
+# stop_for_status(r)
+# json <- toJSON(content(r))
+# terms_of_interest <- c(fromJSON(json)$results$id[[1]], 
+#                        fromJSON(json)$results$descendants[[1]][,1])
+```
+
+-----
+
+# Sliding window DGE
+
+```{r}
+n_samples_in_group <- 8
+window_gap <- 0
+number_of_tests <- nrow(phenotype)
+pheno <- rbind(phenotype, phenotype)
+go_kegga_analysis <- FALSE
+interval <- phenotype$transformed_time[2]
+use_treat <- TRUE
+lfc_threshold <- log2(1.2)
+
+dge_results_list <- list()
+midpoint <- c()
+for (i in seq_len(number_of_tests)) {
+  # # Subset for testing
+  # if (i %% 10 != 0) {
+  #   next
+  # }
+  
+  # Get midpoint
+  m <- interval * (i + n_samples_in_group - 0.5)
+  midpoint <- c(midpoint, m %% 100)
+  # print(m)
+  df <- pheno[i:(i+n_samples_in_group*2 - 1),] %>%
+    mutate(group=rep(c("a", "b"), each=n_samples_in_group))
+  # print(df$sample_id)
+  
+  # design <- model.matrix(~group, df)
+  design <- model.matrix(~group + age, df)
+  exprs <- combat_nc[,df$sample_id]
+  gene_var <- apply(exprs, 1, var)
+  fit <- lmFit(exprs, design)
+  if (use_treat) {
+    fit <- treat(fit, lfc=lfc_threshold)
+  } else {
+    fit <- eBayes(fit)
+  }
+  top_table <- topTable(fit, coef=2, n=Inf, sort.by="p") %>%
+    tibble::rownames_to_column("gene_id") %>%
+    mutate(var=gene_var[gene_id])
+  n_sig <- top_table %>% filter(adj.P.Val < 0.05) %>% nrow
+  print(sprintf("%05.2f - %d", m %% 100, n_sig))
+  if (go_kegga_analysis & n_sig > 10) {
+    # k <- kegga(fit, coef=2, geneid=entrez_ids)
+    # top_kegg <- topKEGG(k, n=Inf) %>% 
+    #   mutate(adj_p_up=p.adjust(P.Up, method="bonferroni"),
+    #          adj_p_down=p.adjust(P.Down, method="bonferroni")) %>%
+    #   filter(adj_p_up < 0.05 | adj_p_down < 0.05)
+    
+    fit$genes$Length <- gene_lengths   ### Check this works
+    g <- goana(fit, coef=2, geneid=entrez_ids, trend="Length")
+    top_go <- topGO(g, n=Inf)[terms_of_interest,] %>%
+      mutate(adj_p_up=p.adjust(P.Up, method="bonferroni"),
+             adj_p_down=p.adjust(P.Down, method="bonferroni"))
+  } else {
+    top_kegg <- NA
+    top_go <- NA
+  }
+  
+  # Save results
+  dge_results_list[[i]] <- list()
+  dge_results_list[[i]][["top_table"]] <- top_table
+  dge_results_list[[i]][["top_kegg"]] <- top_kegg
+  dge_results_list[[i]][["top_go"]] <- top_go
+}
+
+```
+
+```{r}
+length(dge_results_list)
+```
+
+```{r}
+dge_results_df <- data.frame(
+  index=seq_along(midpoint),
+  midpoint=midpoint,
+  mean_var=sapply(dge_results_list, function(x) {mean(x[["top_table"]]$var)}),
+  adj_p_lt_05=sapply(dge_results_list, function(x) {x[["top_table"]] %>% filter(adj.P.Val < 0.05) %>% nrow}),
+  p_lt_05=sapply(dge_results_list, function(x) {x[["top_table"]] %>% filter(P.Value < 0.05) %>% nrow}),
+  p_lt_01=sapply(dge_results_list, function(x) {x[["top_table"]] %>% filter(P.Value < 0.01) %>% nrow}))
+dge_results_df %>% head
+```
+
+```{r}
+ggplot(dge_results_df, aes(x=midpoint, y=p_lt_05)) +
+  geom_point(alpha=0.8) +
+  # scale_y_log10() +
+  scale_x_continuous(breaks=seq(0,100,by=10)) +
+  labs(x="Time Scale", y="Number of genes p < 0.05 (uncorrected)")
+```
+
+
+```{r}
+# # Save output
+# dir_output <- "~/scratch/rapid_change_genes"
+# # dir.create(dir_output)
+# 
+# for (i in seq_along(midpoint)) {
+#   df <- dge_results_list[[i]]$top_table %>% filter(adj.P.Val < 0.05)
+#   filename <- paste0(dir_output, "/", sprintf("%07.3f", midpoint[i]), "_", nrow(df), ".txt")
+#   write.table(df %>% head(20) %>% select(-var, -t),
+#               file=filename, sep="\t", quote=FALSE, row.names=FALSE)
+# }
+```
+
+```{r}
+# tmp <- lapply(dge_results_list, function(x) x$top_table[,c(1,5)]) %>%
+#   do.call(rbind, .)
+# dim(tmp)
+# tmp$adj_p <- p.adjust(tmp$P.Value, method="fdr")
+# 
+# table(tmp$adj_p < 0.05)
+# #   FALSE    TRUE 
+# # 4735209     603 
+```
+
+
+### Genes with largest changes
+
+```{r}
+plot_spline_model <- function(spline_list, y, x, gene_name="", alpha_point=1,
+                              alpha_line=0.5, jitter_height=0, jitter_width=0.05, 
+                              plot=TRUE) {
+  dat <- data.frame(exprs=y, cycle_time=x)
+  g <- ggplot(dat, aes(x=cycle_time, y=exprs)) +
+    geom_jitter(height=jitter_height, width=jitter_width, alpha=alpha_point) +
+    geom_line(spline_list$pred, mapping=aes(x=cycle_time, y=pred), alpha=alpha_line) +
+    labs(title=sprintf("%s | R^2 = %0.3f | edf = %0.2f", 
+                       gene_name, spline_list$R2, spline_list$edf))
+  if (! plot) return(g)
+  print(g)
+}
+```
+
+```{r}
+top_changes <- lapply(1:length(dge_results_list), function(i) {
+  dge_results_list[[i]][["top_table"]] %>% filter(adj.P.Val < 0.05) %>%
+    mutate(midpoint=dge_results_df$midpoint[i])
+}) %>%
+  do.call(rbind, .) %>% arrange(desc(abs(logFC)))
+```
+
+```{r results="markup"}
+for (i in 1:5) {
+  g <- top_changes$gene_id[i]
+  m <- top_changes$midpoint[i]
+  print(g)
+  p <- plot_spline_model(gene_models[[g]],
+                  y=combat_nc[g,phenotype$sample_id], x=phenotype$transformed_time,
+                  gene_name = g, plot=FALSE) +
+  geom_vline(xintercept=m, linetype="dashed", color="red")
+  print(p)
+}
+```
+
+```{r}
+subset <- top_changes %>% filter(midpoint %>% between(50,80)) %>% head
+for (i in 1:5) {
+  g <- subset$gene_id[i]
+  m <- subset$midpoint[i]
+  print(g)
+  p <- plot_spline_model(gene_models[[g]],
+                  y=combat_nc[g,phenotype$sample_id], x=phenotype$transformed_time,
+                  gene_name = g, plot=FALSE) +
+  geom_vline(xintercept=m, linetype="dashed", color="red")
+  print(p)
+}
+```
+
+```{r}
+subset <- top_changes %>% filter(midpoint %>% between(50,80)) %>% filter(logFC > 0) %>% head
+for (i in 1:5) {
+  g <- subset$gene_id[i]
+  m <- subset$midpoint[i]
+  print(g)
+  p <- plot_spline_model(gene_models[[g]],
+                  y=combat_nc[g,phenotype$sample_id], x=phenotype$transformed_time,
+                  gene_name = g, plot=FALSE) +
+  geom_vline(xintercept=m, linetype="dashed", color="red")
+  print(p)
+}
+```
+
+## Top gene for each test
+
+```{r}
+top_single <- lapply(1:length(dge_results_list), function(i) {
+  dge_results_list[[i]][["top_table"]] %>% head(1) %>%
+    mutate(midpoint=dge_results_df$midpoint[i])
+}) %>%
+  do.call(rbind, .)
+# top_single
+```
+
+
+```{r}
+# subset <- top_single
+# for (i in 1:20) {
+#   g <- subset$gene_id[i]
+#   m <- subset$midpoint[i]
+#   # print(g)
+#   p <- plot_spline_model(gene_models[[g]],
+#                   y=combat_nc[g,phenotype$sample_id],
+#                   x=phenotype$transformed_time,
+#                   gene_name = paste(i, g), plot=FALSE) +
+#   geom_vline(xintercept=m, linetype="dashed", color="red")
+#   print(p)
+# }
+```
+
+```{r}
+# Look through and grab a few genes to plot as examples
+subset <- top_single[
+  c(1, 3, 4, 6, 11, 39, 40, 69, 101, 113, 115, 120, 125,
+  129, 139, 140, 147, 151, 153, 155, 156, 157, 158, 164,
+  194, 204, 206, 209, 210, 214, 224, 225, 227, 228, 229,
+  230, 231, 234, 235, 236),]
+# stopifnot(! duplicated(subset$gene_id))
+```
+
+```{r}
+for (i in 1:nrow(subset)) {
+  g <- subset$gene_id[i]
+  m <- subset$midpoint[i]
+  # print(g)
+  p <- plot_spline_model(gene_models[[g]],
+                  y=combat_nc[g,phenotype$sample_id],
+                  x=phenotype$transformed_time,
+                  alpha_line = 0,
+                  gene_name = g, plot=FALSE) +
+  geom_vline(xintercept=m, linetype="dashed", color="red", alpha=0.5) +
+    theme_bw()
+  print(p)
+}
+```
+
+
+```{r}
+saveRDS(subset, here::here("cache/fig6_gene_examples.rds"))
+saveRDS(top_single, here::here("cache/fig6_gene_examples_2.rds"))
+saveRDS(dge_results_df, here::here("cache/fig6a.rds"))
+```
+
+-----
+
+# List of genes that change
+
+Not checked manually. There are probably false positives from low expression.
+
+```{r}
+all_sig <- lapply(1:length(dge_results_list), function(i) {
+  dge_results_list[[i]][["top_table"]] %>% filter(adj.P.Val < 0.05) %>%
+    mutate(midpoint=dge_results_df$midpoint[i])
+}) %>%
+  do.call(rbind, .)
+
+nrow(all_sig)
+unique(all_sig$gene_id) %>% length
+```
+
+```{r}
+# all_sig <- lapply(1:length(dge_results_list), function(i) {
+#   dge_results_list[[i]][["top_table"]] %>% filter(adj.P.Val < 0.01) %>%
+#     mutate(midpoint=dge_results_df$midpoint[i])
+# }) %>%
+#   do.call(rbind, .)
+# 
+# nrow(all_sig)
+# unique(all_sig$gene_id) %>% length
+# # [1] 1332
+# # [1] 879
+```
+
+Get top gene record (lowest p-value) in stages
+
+```{r}
+# Change significantly in menstruation (0-8)
+tmp <- all_sig %>% filter(midpoint %>% between(0,8))
+table(tmp$gene_id) %>% table
+tmp_list <- list()
+for (g in unique(tmp$gene_id)) {
+  tmp_list[[g]] <- tmp %>% filter(gene_id == g) %>% 
+    arrange(adj.P.Val) %>% head(1) %>% unlist
+}
+menst_genes <- do.call(rbind, tmp_list) %>% 
+  as.data.frame(stringsAsFactors=FALSE) %>%
+  mutate(logFC=round(as.numeric(logFC), 4),
+         AveExpr=round(as.numeric(AveExpr), 4),
+         adj.P.Val=round(as.numeric(adj.P.Val), 4),
+         midpoint=round(as.numeric(midpoint), 2)) %>%
+  select(gene_id, midpoint, logFC, AveExpr, adj.P.Val) %>%
+  arrange(midpoint, adj.P.Val)
+nrow(menst_genes)
+```
+
+
+```{r}
+# Change significantly in proliferative (8-58)
+tmp <- all_sig %>% filter(midpoint %>% between(8,58))
+table(tmp$gene_id) %>% table
+tmp_list <- list()
+for (g in unique(tmp$gene_id)) {
+  tmp_list[[g]] <- tmp %>% filter(gene_id == g) %>% 
+    arrange(adj.P.Val) %>% head(1) %>% unlist
+}
+prolif_genes <- do.call(rbind, tmp_list) %>% 
+  as.data.frame(stringsAsFactors=FALSE) %>%
+  mutate(logFC=round(as.numeric(logFC), 4),
+         AveExpr=round(as.numeric(AveExpr), 4),
+         adj.P.Val=round(as.numeric(adj.P.Val), 4),
+         midpoint=round(as.numeric(midpoint), 2)) %>%
+  select(gene_id, midpoint, logFC, AveExpr, adj.P.Val) %>%
+  arrange(midpoint, adj.P.Val)
+nrow(prolif_genes)
+```
+
+
+```{r}
+# Change significantly in secretory (58-100)
+tmp <- all_sig %>% filter(midpoint %>% between(58,100))
+table(tmp$gene_id) %>% table
+tmp_list <- list()
+for (g in unique(tmp$gene_id)) {
+  tmp_list[[g]] <- tmp %>% filter(gene_id == g) %>% 
+    arrange(adj.P.Val) %>% head(1) %>% unlist
+}
+secr_genes <- do.call(rbind, tmp_list) %>% 
+  as.data.frame(stringsAsFactors=FALSE) %>%
+  mutate(logFC=round(as.numeric(logFC), 4),
+         AveExpr=round(as.numeric(AveExpr), 4),
+         adj.P.Val=round(as.numeric(adj.P.Val), 4),
+         midpoint=round(as.numeric(midpoint), 2)) %>%
+  select(gene_id, midpoint, logFC, AveExpr, adj.P.Val) %>%
+  arrange(midpoint, adj.P.Val)
+nrow(secr_genes)
+```
+
+
+```{r}
+top_genes <- list()
+top_genes[["menstrual"]] <- menst_genes
+top_genes[["proliferative"]] <- prolif_genes
+top_genes[["secretory"]] <- secr_genes
+saveRDS(top_genes, here::here("cache/cycle_sig_gene_stages.rds"))
+```
+
+```{r}
+write.table(menst_genes,
+            here::here("output/cycle_sig_1_menstrual.txt"),
+            sep="\t", row.names=FALSE, quote=FALSE)
+write.table(prolif_genes,
+            here::here("output/cycle_sig_2_proliferative.txt"),
+            sep="\t", row.names=FALSE, quote=FALSE)
+write.table(secr_genes,
+            here::here("output/cycle_sig_3_secretory.txt"),
+            sep="\t", row.names=FALSE, quote=FALSE)
+```
+
+-----
+
+# Session Info
+
+```{r}
+devtools::session_info()
+```
+

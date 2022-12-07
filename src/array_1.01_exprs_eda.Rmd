@@ -1,0 +1,683 @@
+---
+title: "Batch Effects EDA"
+author: "Jessica Chung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 4
+---
+
+Exploratory analysis of batch effects in the microarray data.
+
+Try combat with and without cycle stage, and compare.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=TRUE, message=TRUE, error=TRUE, echo=TRUE, results="hold")
+knitr::opts_knit$set(root.dir = "..")
+options(digits=4)
+Sys.setenv(TZ = "Australia/Melbourne")
+```
+
+-----
+
+# Load
+
+```{r message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(sva)
+library(limma)
+library(edgeR)
+```
+
+### Load data
+
+```{r}
+# Microarray data
+exprs <- readRDS("data/array_data/combined_bg_rsn_exprs.rds")
+pval <- readRDS("data/array_data/combined_pval.rds")
+
+# Phenotype data
+phenotype <- readRDS("data/tidy_data/sample_info.rds")
+
+# Batch data
+batch_data <- readRDS("data/array_data/batch_data.rds")
+```
+
+```{r}
+stopifnot(colnames(exprs) == colnames(pval))
+```
+
+-----
+
+# Wrangle
+
+```{r}
+phenotype <- phenotype %>%
+  mutate(study=ifelse(str_detect(sample_id, "^URS"), "study_2", "study_1"))
+urs_array_samples <- phenotype %>% 
+  filter(! is.na(array_data)) %>% 
+  filter(study == "study_2") %>%
+  pull(sample_id)
+```
+
+```{r}
+# Change X# names of URS samples to URS###
+names_to_change <- batch_data %>% filter(study == "study_2") %>% .$sample_id
+tmp <- str_match(names_to_change, "^X([0-9]+)(_?\\w)?$")
+tmp[,2] <- sprintf("%03d", as.numeric(tmp[,2]))
+tmp[,3][is.na(tmp[,3])] <- ""
+new_names <- paste0("URS", tmp[,2], tmp[,3])
+new_name_lookup <- new_names
+names(new_name_lookup) <- names_to_change
+stopifnot(urs_array_samples %in% new_name_lookup)
+new_name_lookup <- new_name_lookup[new_name_lookup %in% urs_array_samples]
+```
+
+```{r}
+urs_indices <- colnames(exprs) %in% names(new_name_lookup)
+colnames(exprs)[urs_indices] <- new_name_lookup[colnames(exprs)[urs_indices]]
+colnames(pval)[urs_indices] <- new_name_lookup[colnames(pval)[urs_indices]]
+
+urs_indices <- batch_data$sample_id %in% names(new_name_lookup)
+batch_data$sample_id[urs_indices] <-
+  new_name_lookup[batch_data$sample_id[urs_indices]]
+```
+
+Combine phenotype cycle stages and batch data cycle stages. Cycle stage from
+batch data may not be reliable.
+
+```{r}
+cycle_stage_df <- merge(phenotype, batch_data, by="sample_id", 
+                        suffixes=c("", ".old"), all.y = TRUE) %>%
+  select(sample_id, contains("cycle_stage")) %>%
+  mutate(cycle_stage=ifelse(is.na(cycle_stage), cycle_stage.old, cycle_stage)) %>%
+  filter(!is.na(cycle_stage)) %>%
+  select(-cycle_stage.old)
+```
+
+
+-----
+
+# Check batch effects
+
+Note there are no samples in batch 4 due to no RedCap data.
+
+```{r}
+# Use all array data from study 1
+study_1_batch_data <- batch_data %>% filter(study == "study_1")
+study_1_batch_data$batch %>% table
+```
+
+```{r}
+# Remove replicates and control samples, and add cycle stage info
+s1_pheno <- study_1_batch_data %>% 
+  filter(str_detect(sample_id, "^X\\d+$")) %>% 
+  select(sample_id, batch, sentrix_barcode) %>%
+  merge(cycle_stage_df, by="sample_id", all.x=TRUE)
+```
+
+
+```{r}
+# Check cycle stage distribution for each batch
+s1_pheno %>% filter(cycle_stage %in% 1:7) %>% 
+  with(table(batch, cycle_stage))
+```
+
+
+## PCA
+
+```{r}
+# Look at all batches except 4, coloured by cycle stage
+subset <- s1_pheno %>% filter(batch != 4) %>% 
+  filter(cycle_stage %in% 1:7)
+pca <- prcomp(t(exprs[,subset$sample_id]))$x[,1:3]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=cycle_stage)) +
+  geom_point()
+```
+
+```{r}
+# PCA looking at a particular cycle stage
+# If using all cycle stages, array batch effect is drowned out
+subset <- s1_pheno %>% filter(cycle_stage == 6)
+pca <- prcomp(t(exprs[,subset$sample_id]))$x[,1:3]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=batch)) +
+  geom_point()
+```
+
+## Pairwise batch comparison
+
+Pairwise comparison of batches.
+
+```{r}
+# Randomly use 10 samples from each batch
+set.seed(20180116)
+n_sample <- 10
+batches <- s1_pheno$batch %>% unique %>% sort
+dge_samples <- c()
+for (b in batches) {
+  subset <- s1_pheno %>% filter(batch == b)
+  dge_samples <- c(dge_samples, sample(subset$sample_id, n_sample))
+}
+
+# Get array data
+dge_pheno <- s1_pheno[match(dge_samples, s1_pheno$sample_id),]
+dge_probes <- rowMeans(pval[,dge_pheno$sample_id] < 0.05) %>% 
+  magrittr::is_greater_than(0.9) %>%
+  names(.)[.]
+dge_y <- exprs[dge_probes,dge_pheno$sample_id]
+dge_results <- matrix(0, nrow=length(batches), ncol=length(batches))
+
+# Pairwise comparisons
+for (i in seq_along(batches)) {
+  b1 <- batches[i]
+  for (j in seq_along(batches)) {
+    b2 <- batches[j]
+    if (b1 == b2) {
+      next
+    }
+    pheno <- dge_pheno %>% filter(batch %in% c(b1, b2))
+    y <- dge_y[,pheno$sample_id]
+    batch <- pheno$batch %>% factor
+    design <- model.matrix(~batch)
+    fit <- lmFit(y, design) %>% eBayes
+    top <- topTable(fit, coef=2, n=Inf)
+    dge_results[i, j] <- sum(top$adj.P.Val < 0.01)
+  }
+}
+
+# View results
+dge_results %>% magrittr::set_colnames(batches) %>% 
+  magrittr::set_rownames(batches)
+```
+
+
+## Sentrix barcode batch effect
+
+See if barcodes have an effect within each batch.
+
+```{r}
+# How confounded are barcodes with cycle stage?
+study_1_batch_data %>% filter(batch == 7) %>%
+  with(table(sentrix_barcode, cycle_stage))
+```
+
+For each batch, for each sentrix barcode, only use samples in the
+proliferative stage.
+
+```{r}
+# Get all barcodes with at least three samples. Only use samples in prolif.
+n_sample <- 3
+subset_pheno <- s1_pheno %>% filter(cycle_stage %in% 2:4)
+batches <- subset_pheno$batch %>% unique %>% sort
+dge_results <- list()
+
+# Get array data
+dge_probes <- rowMeans(pval[,dge_pheno$sample_id] < 0.05) %>% 
+  magrittr::is_greater_than(0.9) %>%
+  names(.)[.]
+dge_y <- exprs[dge_probes,subset_pheno$sample_id]
+
+# Pairwise comparisons
+for (b in batches) {
+  barcodes <- subset_pheno %>% filter(batch == b) %>% .$sentrix_barcode %>%
+    table %>% magrittr::is_weakly_greater_than(n_sample) %>% names(.)[.]
+  dge_results[[b]] <- matrix(0, nrow=length(barcodes), ncol=length(barcodes))
+  
+  for (i in seq_along(barcodes)) {
+    b1 <- barcodes[i]
+    for (j in seq_along(barcodes)) {
+      b2 <- barcodes[j]
+      if (b1 == b2) {
+        next
+      }
+      pheno <- subset_pheno %>% filter(sentrix_barcode %in% c(b1, b2))
+      y <- dge_y[,pheno$sample_id]
+      batch <- pheno$sentrix_barcode %>% factor
+      design <- model.matrix(~batch)
+      fit <- lmFit(y, design) %>% eBayes
+      top <- topTable(fit, coef=2, n=Inf)
+      dge_results[[b]][i, j] <- sum(top$adj.P.Val < 0.05)
+    }
+  }
+  rownames(dge_results[[b]]) <- barcodes
+  colnames(dge_results[[b]]) <- barcodes
+  
+}
+```
+
+```{r}
+# Only print batches with non-zero values
+for (b in batches) {
+  if (! all(dge_results[[b]] == 0)) {
+    print(b)
+    print(dge_results[[b]])
+  }
+}
+```
+
+Batch 4 and batch 7 has some differences between sentrix barcodes.
+
+```{r}
+# Look at the comparison with the most differences in detail
+cat("200536850048 vs 200536980011")
+pheno <- subset_pheno %>% filter(sentrix_barcode %in% c("200536850048", "200536980011"))
+y <- dge_y[,pheno$sample_id]
+batch <- pheno$sentrix_barcode %>% factor
+design <- model.matrix(~batch)
+fit <- lmFit(y, design) %>% eBayes
+top <- topTable(fit, coef=2, n=Inf)
+hist(top$P.Value, breaks=100)
+```
+
+
+
+```{r}
+# Look at the comparison with the most differences in detail
+cat("6898481038 vs 6898481037")
+pheno <- subset_pheno %>% filter(sentrix_barcode %in% c("6898481038", "6898481037"))
+y <- dge_y[,pheno$sample_id]
+batch <- pheno$sentrix_barcode %>% factor
+design <- model.matrix(~batch)
+fit <- lmFit(y, design) %>% eBayes
+top <- topTable(fit, coef=2, n=Inf)
+hist(top$P.Value, breaks=100)
+```
+
+
+## PCA within batches
+
+Correct for cycle stage using residuals.
+
+```{r}
+# All samples
+# Fit linear model and get residuals
+subset <- s1_pheno %>% filter(batch %in% 1:7) %>% filter(cycle_stage %in% 1:7)
+design <- model.matrix(~cycle_stage, subset)
+fit <- lmFit(exprs[,subset$sample_id], design=design)
+Xbeta <- design %*% t(fit$coefficients)
+rownames(Xbeta) <- subset$sample_id
+residuals <- exprs[,subset$sample_id] - t(Xbeta)
+
+# PCA plot with all samples
+pca <- prcomp(t(residuals))$x[,1:4]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=batch)) +
+  geom_point()
+```
+
+
+```{r}
+# Batch 4
+# Fit linear model and get residuals
+subset <- s1_pheno %>% filter(batch %in% 4) %>% filter(cycle_stage %in% 1:7)
+design <- model.matrix(~cycle_stage, subset)
+fit <- lmFit(exprs[,subset$sample_id], design=design)
+Xbeta <- design %*% t(fit$coefficients)
+rownames(Xbeta) <- subset$sample_id
+residuals <- exprs[,subset$sample_id] - t(Xbeta)
+
+# PCA plot with all samples
+pca <- prcomp(t(residuals))$x[,1:4]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=sentrix_barcode)) +
+  geom_point()
+```
+
+```{r}
+# Batch 7
+# Fit linear model and get residuals
+subset <- s1_pheno %>% filter(batch %in% 7) %>% filter(cycle_stage %in% 1:7)
+design <- model.matrix(~cycle_stage, subset)
+fit <- lmFit(exprs[,subset$sample_id], design=design)
+Xbeta <- design %*% t(fit$coefficients)
+rownames(Xbeta) <- subset$sample_id
+residuals <- exprs[,subset$sample_id] - t(Xbeta)
+
+# PCA plot with all samples
+pca <- prcomp(t(residuals))$x[,1:4]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=sentrix_barcode)) +
+  geom_point()
+```
+
+
+```{r}
+# Two barcodes
+# Fit linear model and get residuals
+subset <- s1_pheno %>% 
+  filter(sentrix_barcode %in% c("200536850048", "200536980011")) %>% 
+  filter(cycle_stage %in% 1:7)
+design <- model.matrix(~cycle_stage, subset)
+fit <- lmFit(exprs[,subset$sample_id], design=design)
+Xbeta <- design %*% t(fit$coefficients)
+rownames(Xbeta) <- subset$sample_id
+residuals <- exprs[,subset$sample_id] - t(Xbeta)
+
+# PCA plot with all samples
+pca <- prcomp(t(residuals))$x[,1:4]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=sentrix_barcode)) +
+  geom_point()
+```
+
+Only a few cases where sentrix barcodes have an observable effect.
+
+Only use batches for batch correction, and not sentrix barcodes.
+
+-----
+
+# Combat batches 1-7
+
+Remove batch effect with cycle stage as a covariate.
+
+```{r}
+# Get expression matrix
+y <- exprs[,s1_pheno$sample_id]
+
+# Get batch info
+batch <- s1_pheno$batch %>% factor
+table(batch)
+
+# Combat covariates
+mod <- model.matrix(~cycle_stage, data=s1_pheno)
+head(mod)
+
+# Combat normalisation
+combat_with_cycle_exprs <- ComBat(y, batch=batch, mod=mod)
+```
+
+Remove batch effect without cycle stage as a covariate.
+
+```{r}
+# Get expression matrix
+y <- exprs[,s1_pheno$sample_id]
+
+# Get batch info
+batch <- s1_pheno$batch %>% factor
+table(batch)
+
+# Combat covariates
+mod <- model.matrix(~1, data=s1_pheno)
+
+# Combat normalisation
+combat_without_cycle_exprs <- ComBat(y, batch=batch, mod=mod)
+```
+
+-----
+
+# Post-batch correction analysis
+
+## PCA
+
+```{r}
+# Look at all batches
+subset <- s1_pheno %>% filter(cycle_stage %in% 1:7)
+pca <- prcomp(t(combat_with_cycle_exprs[,subset$sample_id]))$x[,1:3]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=cycle_stage)) +
+  geom_point()
+```
+
+```{r}
+# Look at all batches
+subset <- s1_pheno %>% filter(cycle_stage %in% 1:7)
+pca <- prcomp(t(combat_without_cycle_exprs[,subset$sample_id]))$x[,1:3]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=cycle_stage)) +
+  geom_point()
+```
+
+
+```{r}
+# PCA looking at a particular cycle stage
+subset <- s1_pheno %>% filter(cycle_stage == 6)
+pca <- prcomp(t(combat_without_cycle_exprs[,subset$sample_id]))$x[,1:3]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=batch)) +
+  geom_point()
+```
+
+## Pairwise batch comparisons
+
+Redo pairwise batch comparisons using combat without cycle stage
+
+```{r}
+# Randomly use 10 samples from each batch
+set.seed(20180116)
+n_sample <- 10
+batches <- s1_pheno$batch %>% unique %>% sort
+dge_samples <- c()
+for (b in batches) {
+  subset <- s1_pheno %>% filter(batch == b)
+  dge_samples <- c(dge_samples, sample(subset$sample_id, n_sample))
+}
+
+# Get array data
+dge_pheno <- s1_pheno[match(dge_samples, s1_pheno$sample_id),]
+dge_probes <- rowMeans(pval[,dge_pheno$sample_id] < 0.05) %>% 
+  magrittr::is_greater_than(0.9) %>%
+  names(.)[.]
+dge_y <- combat_without_cycle_exprs[dge_probes,dge_pheno$sample_id]
+dge_results <- matrix(0, nrow=length(batches), ncol=length(batches))
+
+# Pairwise comparisons
+for (i in seq_along(batches)) {
+  b1 <- batches[i]
+  for (j in seq_along(batches)) {
+    b2 <- batches[j]
+    if (b1 == b2) {
+      next
+    }
+    pheno <- dge_pheno %>% filter(batch %in% c(b1, b2))
+    y <- dge_y[,pheno$sample_id]
+    batch <- pheno$batch %>% factor
+    design <- model.matrix(~batch)
+    fit <- lmFit(y, design) %>% eBayes
+    top <- topTable(fit, coef=2, n=Inf)
+    dge_results[i, j] <- sum(top$adj.P.Val < 0.01)
+  }
+}
+
+# View results
+dge_results %>% magrittr::set_colnames(batches) %>% 
+  magrittr::set_rownames(batches)
+```
+
+## Cycle stage differential expression
+
+Compare results between combat with and without cycle stage.
+
+Expect combat without cycle stage will reduce the effects from cycle stage,
+but by how much?
+
+```{r}
+# Randomly use 12 samples from each batch
+# Exclude cycle stage 2 due to too few samples
+set.seed(20180116)
+n_sample <- 12
+cycles <- c(1, 3:7)
+dge_samples <- c()
+for (b in cycles) {
+  subset <- s1_pheno %>% filter(cycle_stage == b)
+  dge_samples <- c(dge_samples, sample(subset$sample_id, n_sample))
+}
+
+# Get array data
+dge_pheno <- s1_pheno[match(dge_samples, s1_pheno$sample_id),]
+dge_probes <- rowMeans(pval[,dge_pheno$sample_id] < 0.05) %>% 
+  magrittr::is_greater_than(0.9) %>%
+  names(.)[.]
+dge_y <- combat_without_cycle_exprs[dge_probes,dge_pheno$sample_id]
+dge_results <- matrix(0, nrow=length(cycles), ncol=length(cycles))
+
+# Pairwise comparisons
+for (i in seq_along(cycles)) {
+  c1 <- cycles[i]
+  for (j in seq_along(cycles)) {
+    c2 <- cycles[j]
+    if (c1 == c2) {
+      next
+    }
+    pheno <- dge_pheno %>% filter(cycle_stage %in% c(c1, c2))
+    y <- dge_y[,pheno$sample_id]
+    cycle <- pheno$cycle_stage %>% factor
+    design <- model.matrix(~cycle)
+    fit <- lmFit(y, design) %>% eBayes
+    top <- topTable(fit, coef=2, n=Inf)
+    dge_results[i, j] <- sum(top$adj.P.Val < 0.01)
+  }
+}
+
+# View results
+dge_results %>% magrittr::set_colnames(cycles) %>% 
+  magrittr::set_rownames(cycles)
+```
+
+Redo with combat with cycle stage
+
+```{r}
+# Randomly use 12 samples from each batch
+# Exclude cycle stage 2 due to too few samples
+set.seed(20180116)
+n_sample <- 12
+cycles <- c(1, 3:7)
+dge_samples <- c()
+for (b in cycles) {
+  subset <- s1_pheno %>% filter(cycle_stage == b)
+  dge_samples <- c(dge_samples, sample(subset$sample_id, n_sample))
+}
+
+# Get array data
+dge_pheno <- s1_pheno[match(dge_samples, s1_pheno$sample_id),]
+dge_probes <- rowMeans(pval[,dge_pheno$sample_id] < 0.05) %>% 
+  magrittr::is_greater_than(0.9) %>%
+  names(.)[.]
+dge_y <- combat_with_cycle_exprs[dge_probes,dge_pheno$sample_id]
+dge_results <- matrix(0, nrow=length(cycles), ncol=length(cycles))
+
+# Pairwise comparisons
+for (i in seq_along(cycles)) {
+  c1 <- cycles[i]
+  for (j in seq_along(cycles)) {
+    c2 <- cycles[j]
+    if (c1 == c2) {
+      next
+    }
+    pheno <- dge_pheno %>% filter(cycle_stage %in% c(c1, c2))
+    y <- dge_y[,pheno$sample_id]
+    cycle <- pheno$cycle_stage %>% factor
+    design <- model.matrix(~cycle)
+    fit <- lmFit(y, design) %>% eBayes
+    top <- topTable(fit, coef=2, n=Inf)
+    dge_results[i, j] <- sum(top$adj.P.Val < 0.01)
+  }
+}
+
+# View results
+dge_results %>% magrittr::set_colnames(cycles) %>% 
+  magrittr::set_rownames(cycles)
+```
+
+When not using cycle stage as a covariate, expression effects from cycle stage 
+are reduced, but there's still lots of signal.
+
+Some samples have unknown cycle stages, so it's better to just keep all
+study 1 samples instead of only using those with known cycle stages.
+
+Therefore, use combat without cycle stage as a covariate.
+
+-----
+
+# Study 2
+
+## Check batch effects
+
+```{r}
+study_2_batch_data <- batch_data %>%
+  filter(study == "study_2")
+```
+
+
+```{r}
+study_2_batch_data$batch %>% table
+```
+
+```{r}
+# Remove replicates and control samples, and merge with sample info
+s2_pheno <- merge(study_2_batch_data, phenotype, by="sample_id")
+
+stopifnot(s2_pheno$sample_id %in% colnames(exprs))
+stopifnot(! is.na(s2_pheno$batch))
+```
+
+
+```{r}
+# Check day distribution for each batch
+with(s2_pheno, table(batch, consensus_pod_urs_only))
+```
+
+
+## PCA
+
+```{r}
+subset <- s2_pheno %>% filter(! is.na(consensus_pod_urs_only))
+pca <- prcomp(t(exprs[,subset$sample_id]))$x[,1:3]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=batch, label=sample_id)) +
+  geom_point() +
+  geom_text(size=2, nudge_x=3)
+```
+
+Batch 6 is comprised of two separate batches.
+
+```{r}
+ggplot(dat %>% filter(batch == "6"), 
+       aes(x=PC1, y=PC2, color=sentrix_barcode)) +
+  geom_point()
+```
+
+```{r}
+# Plot with cycle day
+ggplot(dat, aes(x=PC1, y=PC2, color=consensus_pod_urs_only)) +
+  geom_point()
+```
+
+## Separate batch 6
+
+```{r}
+batch_6.1_barcodes <- c("3999650006", "3999650008", "3999650067", "3999650060")
+batch_6.2_barcodes <- c("3999650037", "3999650055", "3999650048", "3999650059")
+
+s2_pheno <- s2_pheno %>% 
+  mutate(batch=ifelse(sentrix_barcode %in% batch_6.1_barcodes, "6.1", batch),
+         batch=ifelse(sentrix_barcode %in% batch_6.2_barcodes, "6.2", batch))
+```
+
+```{r}
+subset <- s2_pheno %>% filter(! is.na(consensus_pod_urs_only))
+pca <- prcomp(t(exprs[,subset$sample_id]))$x[,1:3]
+dat <- cbind(subset, pca)
+ggplot(dat, aes(x=PC1, y=PC2, color=batch)) +
+  geom_point()
+```
+
+```{r}
+with(s2_pheno, table(batch, consensus_pod_urs_only))
+```
+
+
+-----
+
+# Session Info
+
+```{r}
+devtools::session_info()
+```
+
